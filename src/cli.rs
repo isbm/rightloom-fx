@@ -1,4 +1,4 @@
-use std::{path::PathBuf, str::FromStr};
+use std::str::FromStr;
 
 #[cfg(test)]
 use std::ffi::OsString;
@@ -6,7 +6,10 @@ use std::ffi::OsString;
 use clap::{Arg, ArgAction, ArgGroup, ArgMatches, Command as ClapCommand, builder::styling};
 use colored::Colorize;
 
-use crate::scratches::{Resolution, ScratchType};
+use crate::{
+    render::{RenderSettings, Resolution},
+    scratches::ScratchType,
+};
 
 const APP_NAME: &str = "rightloom-fx";
 
@@ -18,15 +21,18 @@ pub(crate) struct Cli {
 #[derive(Debug)]
 pub(crate) enum Command {
     Scratches(ScratchesArgs),
+    Stain(StainArgs),
 }
 
 #[derive(Debug)]
 pub(crate) struct ScratchesArgs {
-    pub(crate) resolution: Resolution,
-    pub(crate) density: u8,
+    pub(crate) render: RenderSettings,
     pub(crate) effects: Vec<ScratchType>,
-    pub(crate) amount: u32,
-    pub(crate) outdir: PathBuf,
+}
+
+#[derive(Debug)]
+pub(crate) struct StainArgs {
+    pub(crate) render: RenderSettings,
 }
 
 impl Cli {
@@ -46,35 +52,46 @@ impl Cli {
     }
 
     fn from_matches(matches: &ArgMatches) -> Self {
-        let (_, scratches) = matches
+        let (name, arguments) = matches
             .subcommand()
             .expect("clap requires a supported subcommand");
 
-        Self {
-            command: Command::Scratches(ScratchesArgs {
-                resolution: scratches
-                    .get_one::<Resolution>("resolution")
-                    .or_else(|| scratches.get_one("aspect-ratio"))
-                    .copied()
-                    .expect("clap requires a resolution"),
-                density: *scratches
-                    .get_one("density")
-                    .expect("clap requires a density"),
-                effects: scratches
+        let command = match name {
+            "scratches" => Command::Scratches(ScratchesArgs {
+                render: render_settings(arguments),
+                effects: arguments
                     .get_many("type")
                     .expect("clap requires at least one scratch type")
                     .copied()
                     .collect(),
-                amount: *scratches
-                    .get_one("amount")
-                    .expect("clap requires an amount"),
-                outdir: PathBuf::from(
-                    scratches
-                        .get_one::<String>("outdir")
-                        .expect("clap requires an output directory"),
-                ),
             }),
-        }
+            "stain" => Command::Stain(StainArgs {
+                render: render_settings(arguments),
+            }),
+            _ => unreachable!("clap only exposes configured subcommands"),
+        };
+
+        Self { command }
+    }
+}
+
+fn render_settings(arguments: &ArgMatches) -> RenderSettings {
+    RenderSettings {
+        resolution: arguments
+            .get_one::<Resolution>("resolution")
+            .or_else(|| arguments.get_one("aspect-ratio"))
+            .copied()
+            .expect("clap requires a resolution"),
+        density: *arguments
+            .get_one("density")
+            .expect("clap requires a density"),
+        amount: *arguments
+            .get_one("amount")
+            .expect("clap requires an amount"),
+        outdir: arguments
+            .get_one::<String>("outdir")
+            .expect("clap requires an output directory")
+            .into(),
     }
 }
 
@@ -84,7 +101,6 @@ pub(crate) fn cli() -> ClapCommand {
         .usage(styling::AnsiColor::Yellow.on_default())
         .literal(styling::AnsiColor::BrightGreen.on_default())
         .placeholder(styling::AnsiColor::BrightMagenta.on_default());
-    let types = ScratchType::names().join(", ");
 
     ClapCommand::new(APP_NAME)
         .version(env!("CARGO_PKG_VERSION"))
@@ -94,84 +110,102 @@ pub(crate) fn cli() -> ClapCommand {
         ))
         .arg_required_else_help(true)
         .subcommand_required(true)
-        .subcommand(
-            ClapCommand::new("scratches")
-                .about("Generate transparent PNG overlays of physical film defects")
-                .styles(styles.clone())
-                .arg(
-                    Arg::new("resolution")
-                        .short('r')
-                        .long("resolution")
-                        .value_name("WIDTHxHEIGHT")
-                        .help("Output dimensions, for example 3840x2160")
-                        .value_parser(parse_resolution),
-                )
-                .arg(
-                    Arg::new("aspect-ratio")
-                        .short('R')
-                        .long("aspect-ratio")
-                        .value_name("RATIOxLONG_SIDE")
-                        .help("Generate using an aspect ratio and longest output side")
-                        .long_help(
-                            "Generate using a width:height ratio and the longest output side.\n\nExamples:\n  3:2x6240\n  2:3x6240\n  16:9x3840\n  1:1x4000\n\nCommon ratios (examples only):\n  3:2   common still-camera format\n  4:3   digital / Micro Four Thirds\n  1:1   square\n  4:5   portrait\n  5:4   print / large-format\n  16:9  widescreen\n  9:16  vertical widescreen\n  2:1   panoramic\n  21:9  ultrawide / cinematic",
-                        )
-                        .value_parser(parse_aspect_ratio),
-                )
-                .arg(
-                    Arg::new("density")
-                        .short('d')
-                        .long("density")
-                        .value_name("PERCENT")
-                        .help("Effect density from 0 to 100")
-                        .required(true)
-                        .value_parser(parse_density),
-                )
-                .arg(
-                    Arg::new("type")
-                        .short('t')
-                        .long("type")
-                        .value_name("TYPE")
-                        .help(format!(
-                            "Scratch effect to combine; repeat for multiple effects. Available types: {}",
-                            types.bright_green()
-                        ))
-                        .required(true)
-                        .action(ArgAction::Append)
-                        .value_parser(parse_scratch_type),
-                )
-                .arg(
-                    Arg::new("amount")
-                        .short('a')
-                        .long("amount")
-                        .value_name("COUNT")
-                        .help("Number of images to generate")
-                        .required(true)
-                        .value_parser(parse_amount),
-                )
-                .arg(
-                    Arg::new("outdir")
-                        .short('o')
-                        .long("outdir")
-                        .value_name("PATH")
-                        .help("Directory for numbered PNG outputs")
-                        .required(true),
-                )
-                .group(
-                    ArgGroup::new("dimensions")
-                        .args(["resolution", "aspect-ratio"])
-                        .required(true)
-                        .multiple(false),
-                )
-                .after_help(format!(
-                    "{}\n  {}  tiny irregular film-dust artifacts\n  {}  thin, broken transport scratches\n  {}    soft curved crease and stress marks",
-                    "Supported scratch types:".bright_yellow().bold(),
-                    "dust".bright_green(),
-                    "camera".bright_green(),
-                    "bend".bright_green(),
-                )),
-        )
+        .subcommand(scratches_command(styles.clone()))
+        .subcommand(stain_command(styles.clone()))
         .disable_colored_help(false)
         .styles(styles)
+}
+
+fn scratches_command(styles: styling::Styles) -> ClapCommand {
+    let types = ScratchType::names().join(", ");
+    shared_render_arguments(
+        ClapCommand::new("scratches")
+            .about("Generate transparent PNG overlays of physical film defects")
+            .styles(styles)
+            .arg(
+                Arg::new("type")
+                    .short('t')
+                    .long("type")
+                    .value_name("TYPE")
+                    .help(format!(
+                        "Scratch effect to combine; repeat for multiple effects. Available types: {}",
+                        types.bright_green()
+                    ))
+                    .required(true)
+                    .action(ArgAction::Append)
+                    .value_parser(parse_scratch_type),
+            )
+            .after_help(format!(
+                "{}\n  {}  tiny irregular film-dust artifacts\n  {}  thin, broken transport scratches\n  {}    soft curved crease and stress marks",
+                "Supported scratch types:".bright_yellow().bold(),
+                "dust".bright_green(),
+                "camera".bright_green(),
+                "bend".bright_green(),
+            )),
+    )
+}
+
+fn stain_command(styles: styling::Styles) -> ClapCommand {
+    shared_render_arguments(
+        ClapCommand::new("stain")
+            .about("Generate transparent PNG overlays of analog-film development stains")
+            .styles(styles),
+    )
+}
+
+fn shared_render_arguments(command: ClapCommand) -> ClapCommand {
+    command
+        .arg(
+            Arg::new("resolution")
+                .short('r')
+                .long("resolution")
+                .value_name("WIDTHxHEIGHT")
+                .help("Output dimensions, for example 3840x2160")
+                .value_parser(parse_resolution),
+        )
+        .arg(
+            Arg::new("aspect-ratio")
+                .short('R')
+                .long("aspect-ratio")
+                .value_name("RATIOxLONG_SIDE")
+                .help("Generate using an aspect ratio and longest output side")
+                .long_help(
+                    "Generate using a width:height ratio and the longest output side.\n\nExamples:\n  3:2x6240\n  2:3x6240\n  16:9x3840\n  1:1x4000\n\nCommon ratios (examples only):\n  3:2   common still-camera format\n  4:3   digital / Micro Four Thirds\n  1:1   square\n  4:5   portrait\n  5:4   print / large-format\n  16:9  widescreen\n  9:16  vertical widescreen\n  2:1   panoramic\n  21:9  ultrawide / cinematic",
+                )
+                .value_parser(parse_aspect_ratio),
+        )
+        .arg(
+            Arg::new("density")
+                .short('d')
+                .long("density")
+                .value_name("PERCENT")
+                .help("Effect density from 0 to 100")
+                .required(true)
+                .value_parser(parse_density),
+        )
+        .arg(
+            Arg::new("amount")
+                .short('a')
+                .long("amount")
+                .value_name("COUNT")
+                .help("Number of images to generate")
+                .required(true)
+                .value_parser(parse_amount),
+        )
+        .arg(
+            Arg::new("outdir")
+                .short('o')
+                .long("outdir")
+                .value_name("PATH")
+                .help("Directory for numbered PNG outputs")
+                .required(true),
+        )
+        .group(
+            ArgGroup::new("dimensions")
+                .args(["resolution", "aspect-ratio"])
+                .required(true)
+                .multiple(false),
+        )
 }
 
 pub(crate) fn parse_resolution(value: &str) -> Result<Resolution, String> {
@@ -278,16 +312,14 @@ mod tests {
     }
 
     #[test]
-    fn cli_accepts_exact_resolution() {
+    fn stain_cli_accepts_exact_resolution() {
         let cli = Cli::try_parse_from([
             "rightloom-fx",
-            "scratches",
+            "stain",
             "-r",
             "6240x4160",
             "-d",
             "10",
-            "-t",
-            "dust",
             "-a",
             "1",
             "-o",
@@ -295,23 +327,22 @@ mod tests {
         ])
         .expect("exact resolution should parse");
         let resolution = match cli.command {
-            Command::Scratches(args) => args.resolution,
+            Command::Stain(args) => args.render.resolution,
+            Command::Scratches(_) => panic!("stain command should parse as stain"),
         };
 
         assert_eq!((resolution.width(), resolution.height()), (6240, 4160));
     }
 
     #[test]
-    fn cli_accepts_aspect_ratio_resolution() {
+    fn stain_cli_accepts_aspect_ratio_resolution() {
         let cli = Cli::try_parse_from([
             "rightloom-fx",
-            "scratches",
+            "stain",
             "-R",
             "2:3x6240",
             "-d",
             "10",
-            "-t",
-            "dust",
             "-a",
             "1",
             "-o",
@@ -319,7 +350,8 @@ mod tests {
         ])
         .expect("aspect ratio should parse");
         let resolution = match cli.command {
-            Command::Scratches(args) => args.resolution,
+            Command::Stain(args) => args.render.resolution,
+            Command::Scratches(_) => panic!("stain command should parse as stain"),
         };
 
         assert_eq!((resolution.width(), resolution.height()), (4160, 6240));
@@ -329,11 +361,9 @@ mod tests {
     fn cli_requires_exactly_one_dimension_input() {
         let neither = Cli::try_parse_from([
             "rightloom-fx",
-            "scratches",
+            "stain",
             "-d",
             "10",
-            "-t",
-            "dust",
             "-a",
             "1",
             "-o",
@@ -341,15 +371,13 @@ mod tests {
         ]);
         let both = Cli::try_parse_from([
             "rightloom-fx",
-            "scratches",
+            "stain",
             "-r",
             "6240x4160",
             "-R",
             "3:2x6240",
             "-d",
             "10",
-            "-t",
-            "dust",
             "-a",
             "1",
             "-o",
