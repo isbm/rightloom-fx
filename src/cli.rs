@@ -3,12 +3,12 @@ use std::{path::PathBuf, str::FromStr};
 #[cfg(test)]
 use std::ffi::OsString;
 
-use clap::{Arg, ArgAction, ArgMatches, Command as ClapCommand, builder::styling};
+use clap::{Arg, ArgAction, ArgGroup, ArgMatches, Command as ClapCommand, builder::styling};
 use colored::Colorize;
 
 use crate::scratches::{Resolution, ScratchType};
 
-const APP_NAME: &str = "film-fx";
+const APP_NAME: &str = "rightloom-fx";
 
 #[derive(Debug)]
 pub(crate) struct Cli {
@@ -52,8 +52,10 @@ impl Cli {
 
         Self {
             command: Command::Scratches(ScratchesArgs {
-                resolution: *scratches
-                    .get_one("resolution")
+                resolution: scratches
+                    .get_one::<Resolution>("resolution")
+                    .or_else(|| scratches.get_one("aspect-ratio"))
+                    .copied()
                     .expect("clap requires a resolution"),
                 density: *scratches
                     .get_one("density")
@@ -102,8 +104,18 @@ pub(crate) fn cli() -> ClapCommand {
                         .long("resolution")
                         .value_name("WIDTHxHEIGHT")
                         .help("Output dimensions, for example 3840x2160")
-                        .required(true)
                         .value_parser(parse_resolution),
+                )
+                .arg(
+                    Arg::new("aspect-ratio")
+                        .short('R')
+                        .long("aspect-ratio")
+                        .value_name("RATIOxLONG_SIDE")
+                        .help("Generate using an aspect ratio and longest output side")
+                        .long_help(
+                            "Generate using a width:height ratio and the longest output side.\n\nExamples:\n  3:2x6240\n  2:3x6240\n  16:9x3840\n  1:1x4000\n\nCommon ratios (examples only):\n  3:2   common still-camera format\n  4:3   digital / Micro Four Thirds\n  1:1   square\n  4:5   portrait\n  5:4   print / large-format\n  16:9  widescreen\n  9:16  vertical widescreen\n  2:1   panoramic\n  21:9  ultrawide / cinematic",
+                        )
+                        .value_parser(parse_aspect_ratio),
                 )
                 .arg(
                     Arg::new("density")
@@ -144,6 +156,12 @@ pub(crate) fn cli() -> ClapCommand {
                         .help("Directory for numbered PNG outputs")
                         .required(true),
                 )
+                .group(
+                    ArgGroup::new("dimensions")
+                        .args(["resolution", "aspect-ratio"])
+                        .required(true)
+                        .multiple(false),
+                )
                 .after_help(format!(
                     "{}\n  {}  tiny irregular film-dust artifacts\n  {}  thin, broken transport scratches\n  {}    soft curved crease and stress marks",
                     "Supported scratch types:".bright_yellow().bold(),
@@ -158,6 +176,10 @@ pub(crate) fn cli() -> ClapCommand {
 
 pub(crate) fn parse_resolution(value: &str) -> Result<Resolution, String> {
     Resolution::from_str(value).map_err(|error| error.to_string())
+}
+
+pub(crate) fn parse_aspect_ratio(value: &str) -> Result<Resolution, String> {
+    Resolution::from_aspect_ratio(value).map_err(|error| error.to_string())
 }
 
 pub(crate) fn parse_density(value: &str) -> Result<u8, String> {
@@ -192,7 +214,7 @@ pub(crate) fn parse_amount(value: &str) -> Result<u32, String> {
 mod tests {
     use std::str::FromStr;
 
-    use super::{Cli, cli, parse_amount, parse_density, parse_scratch_type};
+    use super::{Cli, Command, cli, parse_amount, parse_density, parse_scratch_type};
     use crate::scratches::{Resolution, ScratchType};
 
     #[test]
@@ -238,7 +260,7 @@ mod tests {
     #[test]
     fn cli_rejects_unknown_scratch_types() {
         let result = Cli::try_parse_from([
-            "film-fx",
+            "rightloom-fx",
             "scratches",
             "-r",
             "320x200",
@@ -256,15 +278,100 @@ mod tests {
     }
 
     #[test]
+    fn cli_accepts_exact_resolution() {
+        let cli = Cli::try_parse_from([
+            "rightloom-fx",
+            "scratches",
+            "-r",
+            "6240x4160",
+            "-d",
+            "10",
+            "-t",
+            "dust",
+            "-a",
+            "1",
+            "-o",
+            "output",
+        ])
+        .expect("exact resolution should parse");
+        let resolution = match cli.command {
+            Command::Scratches(args) => args.resolution,
+        };
+
+        assert_eq!((resolution.width(), resolution.height()), (6240, 4160));
+    }
+
+    #[test]
+    fn cli_accepts_aspect_ratio_resolution() {
+        let cli = Cli::try_parse_from([
+            "rightloom-fx",
+            "scratches",
+            "-R",
+            "2:3x6240",
+            "-d",
+            "10",
+            "-t",
+            "dust",
+            "-a",
+            "1",
+            "-o",
+            "output",
+        ])
+        .expect("aspect ratio should parse");
+        let resolution = match cli.command {
+            Command::Scratches(args) => args.resolution,
+        };
+
+        assert_eq!((resolution.width(), resolution.height()), (4160, 6240));
+    }
+
+    #[test]
+    fn cli_requires_exactly_one_dimension_input() {
+        let neither = Cli::try_parse_from([
+            "rightloom-fx",
+            "scratches",
+            "-d",
+            "10",
+            "-t",
+            "dust",
+            "-a",
+            "1",
+            "-o",
+            "output",
+        ]);
+        let both = Cli::try_parse_from([
+            "rightloom-fx",
+            "scratches",
+            "-r",
+            "6240x4160",
+            "-R",
+            "3:2x6240",
+            "-d",
+            "10",
+            "-t",
+            "dust",
+            "-a",
+            "1",
+            "-o",
+            "output",
+        ]);
+
+        assert!(neither.is_err());
+        assert!(both.is_err());
+    }
+
+    #[test]
     fn scratches_help_lists_supported_types() {
         let command = cli();
         let error = command
-            .try_get_matches_from(["film-fx", "scratches", "--help"])
+            .try_get_matches_from(["rightloom-fx", "scratches", "--help"])
             .expect_err("help should short-circuit parsing");
         let help = error.to_string();
 
         assert!(help.contains("dust"));
         assert!(help.contains("camera"));
         assert!(help.contains("bend"));
+        assert!(help.contains("3:2x6240"));
+        assert!(help.contains("21:9"));
     }
 }

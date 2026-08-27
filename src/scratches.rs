@@ -32,6 +32,86 @@ impl Resolution {
     pub fn height(self) -> u32 {
         self.height
     }
+
+    pub fn from_aspect_ratio(value: &str) -> Result<Self, ResolutionParseError> {
+        let value = value.trim();
+        let mut parts = value.split('x');
+        let Some(ratio) = parts.next() else {
+            return Err(ResolutionParseError::malformed_aspect_ratio(value));
+        };
+        let Some(long_side) = parts.next() else {
+            return Err(ResolutionParseError::malformed_aspect_ratio(value));
+        };
+
+        if ratio.is_empty() || long_side.is_empty() || parts.next().is_some() {
+            return Err(ResolutionParseError::malformed_aspect_ratio(value));
+        }
+
+        let mut ratio_parts = ratio.split(':');
+        let Some(width_ratio) = ratio_parts.next() else {
+            return Err(ResolutionParseError::malformed_aspect_ratio(value));
+        };
+        let Some(height_ratio) = ratio_parts.next() else {
+            return Err(ResolutionParseError::malformed_aspect_ratio(value));
+        };
+
+        if width_ratio.is_empty() || height_ratio.is_empty() || ratio_parts.next().is_some() {
+            return Err(ResolutionParseError::malformed_aspect_ratio(value));
+        }
+
+        let width_ratio = parse_positive_aspect_component(value, width_ratio, "width ratio")?;
+        let height_ratio = parse_positive_aspect_component(value, height_ratio, "height ratio")?;
+        let long_side = parse_positive_aspect_component(value, long_side, "long side")?;
+        let long_side = u32::try_from(long_side).map_err(|_| {
+            ResolutionParseError(format!(
+                "invalid aspect ratio '{value}': long side exceeds the maximum output dimension"
+            ))
+        })?;
+
+        let longest_ratio = u128::from(width_ratio.max(height_ratio));
+        let shortest_ratio = u128::from(width_ratio.min(height_ratio));
+        let shorter_side =
+            (u128::from(long_side) * shortest_ratio + longest_ratio / 2) / longest_ratio;
+
+        if shorter_side == 0 {
+            return Err(ResolutionParseError(format!(
+                "invalid aspect ratio '{value}': computed output dimension is zero"
+            )));
+        }
+
+        let shorter_side = u32::try_from(shorter_side).map_err(|_| {
+            ResolutionParseError(format!(
+                "invalid aspect ratio '{value}': computed output dimension is too large"
+            ))
+        })?;
+        let (width, height) = if width_ratio >= height_ratio {
+            (long_side, shorter_side)
+        } else {
+            (shorter_side, long_side)
+        };
+
+        Self::new(width, height)
+    }
+}
+
+fn parse_positive_aspect_component(
+    input: &str,
+    value: &str,
+    component: &str,
+) -> Result<u64, ResolutionParseError> {
+    let parsed = value.parse::<u64>().map_err(|_| {
+        ResolutionParseError(format!(
+            "invalid aspect ratio '{input}': {component} '{value}' must be a positive integer"
+        ))
+    })?;
+
+    if parsed == 0 {
+        return Err(ResolutionParseError(format!(
+            "invalid aspect ratio '{input}': {component} must be greater than zero"
+        )));
+    }
+
+    Ok(parsed)
 }
 
 impl FromStr for Resolution {
@@ -72,6 +152,12 @@ pub struct ResolutionParseError(String);
 impl ResolutionParseError {
     fn malformed() -> Self {
         Self("resolution must use WIDTHxHEIGHT, for example 3840x2160".to_owned())
+    }
+
+    fn malformed_aspect_ratio(value: &str) -> Self {
+        Self(format!(
+            "invalid aspect ratio '{value}': expected WIDTH_RATIO:HEIGHT_RATIOxLONG_SIDE, for example 3:2x6240"
+        ))
     }
 }
 
@@ -692,6 +778,8 @@ fn blend_pixel(image: &mut RgbaImage, x: u32, y: u32, shade: u8, alpha: u8) {
 
 #[cfg(test)]
 mod tests {
+    use std::str::FromStr;
+
     use rand::{SeedableRng, rngs::StdRng};
 
     use super::{Resolution, ScratchSettings, ScratchType, render_image};
@@ -703,6 +791,67 @@ mod tests {
             effects: vec![effect],
             amount: 1,
             outdir: "unused".into(),
+        }
+    }
+
+    #[test]
+    fn exact_resolutions_parse() {
+        for (input, expected) in [("6240x4160", (6240, 4160)), ("3840x2160", (3840, 2160))] {
+            let resolution = Resolution::from_str(input).expect("resolution should parse");
+
+            assert_eq!((resolution.width(), resolution.height()), expected);
+        }
+    }
+
+    #[test]
+    fn aspect_ratios_resolve_to_output_dimensions() {
+        for (input, expected) in [
+            ("3:2x4000", (4000, 2667)),
+            ("2:3x4000", (2667, 4000)),
+            ("16:9x3840", (3840, 2160)),
+            ("9:16x3840", (2160, 3840)),
+            ("1:1x4000", (4000, 4000)),
+            ("3:2x6240", (6240, 4160)),
+            ("2:3x6240", (4160, 6240)),
+            ("7:5x5000", (5000, 3571)),
+        ] {
+            let resolution =
+                Resolution::from_aspect_ratio(input).expect("aspect ratio should resolve");
+
+            assert_eq!(
+                (resolution.width(), resolution.height()),
+                expected,
+                "{input}"
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_dimension_inputs_are_rejected() {
+        for input in ["6240", "6240x", "x4160", "6240x4160x1", "0x4160", "6240x0"] {
+            assert!(Resolution::from_str(input).is_err(), "{input} should fail");
+        }
+
+        for input in [
+            "3:2",
+            "3:2x",
+            "x4000",
+            ":2x4000",
+            "3:x4000",
+            "3:2:1x4000",
+            "3/2x4000",
+            "3:2x4000x1",
+            "0:2x4000",
+            "3:0x4000",
+            "3:2x0",
+            "1:3x1",
+            "18446744073709551616:2x4000",
+            "3:2x4294967296",
+        ] {
+            assert!(
+                Resolution::from_aspect_ratio(input).is_err(),
+                "{input} should fail"
+            );
         }
     }
 

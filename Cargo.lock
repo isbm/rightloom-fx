@@ -149,16 +149,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "film-fx"
-version = "0.1.0"
-dependencies = [
- "clap",
- "colored",
- "image",
- "rand",
-]
-
-[[package]]
 name = "flate2"
 version = "1.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -319,6 +309,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "76afc826de14238e6e8c374ddcc1fa19e374fd8dd986b0d2af0d02377261d83c"
 dependencies = [
  "getrandom",
+]
+
+[[package]]
+name = "rightloom-fx"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "colored",
+ "image",
+ "rand",
 ]
 
 [[package]]

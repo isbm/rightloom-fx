@@ -58,7 +58,7 @@ mod tests {
         fn new() -> Self {
             let number = TEMP_DIRECTORY_COUNTER.fetch_add(1, Ordering::Relaxed);
             let path =
-                std::env::temp_dir().join(format!("film-fx-test-{}-{number}", process::id()));
+                std::env::temp_dir().join(format!("rightloom-fx-test-{}-{number}", process::id()));
             fs::create_dir_all(&path).expect("temporary output directory should be created");
             Self(path)
         }
@@ -80,7 +80,7 @@ mod tests {
         let output_argument = output.path().to_string_lossy().into_owned();
 
         run_from([
-            "film-fx",
+            "rightloom-fx",
             "scratches",
             "-r",
             "320x200",
