@@ -168,12 +168,62 @@ impl fmt::Display for ResolutionParseError {
 
 impl Error for ResolutionParseError {}
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RgbColor {
+    r: u8,
+    g: u8,
+    b: u8,
+}
+
+impl RgbColor {
+    pub const BLACK: Self = Self::new(0, 0, 0);
+
+    pub const fn new(r: u8, g: u8, b: u8) -> Self {
+        Self { r, g, b }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExportPolicy {
+    PreserveAlpha,
+    Flatten(RgbColor),
+}
+
+impl Default for ExportPolicy {
+    fn default() -> Self {
+        Self::Flatten(RgbColor::BLACK)
+    }
+}
+
+impl ExportPolicy {
+    fn apply_to(self, image: &mut RgbaImage) {
+        let Self::Flatten(background) = self else {
+            return;
+        };
+
+        for pixel in image.pixels_mut() {
+            let alpha = u32::from(pixel[3]);
+            let inverse_alpha = 255 - alpha;
+            for (channel, background_channel) in
+                [(0, background.r), (1, background.g), (2, background.b)]
+            {
+                pixel[channel] = ((u32::from(pixel[channel]) * alpha
+                    + u32::from(background_channel) * inverse_alpha
+                    + 127)
+                    / 255) as u8;
+            }
+            pixel[3] = 255;
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct RenderSettings {
     pub resolution: Resolution,
     pub density: u8,
     pub amount: u32,
     pub outdir: PathBuf,
+    pub export_policy: ExportPolicy,
 }
 
 impl RenderSettings {
@@ -192,6 +242,8 @@ impl RenderSettings {
 #[derive(Debug)]
 pub enum RenderError {
     InvalidDensity(u8),
+    InvalidBlur(u8),
+    InvalidStrength(u8),
     InvalidAmount,
     NoEffects,
     CreateOutput {
@@ -212,6 +264,15 @@ impl fmt::Display for RenderError {
                 write!(
                     formatter,
                     "density must be between 0 and 100, got {density}"
+                )
+            }
+            Self::InvalidBlur(blur) => {
+                write!(formatter, "blur must be between 0 and 100, got {blur}")
+            }
+            Self::InvalidStrength(strength) => {
+                write!(
+                    formatter,
+                    "strength must be between 0 and 100, got {strength}"
                 )
             }
             Self::InvalidAmount => write!(formatter, "amount must be at least 1"),
@@ -259,7 +320,8 @@ where
     prepare_output_directory(&settings.outdir)?;
 
     for number in 1..=settings.amount {
-        let image = render();
+        let mut image = render();
+        settings.export_policy.apply_to(&mut image);
         let path = settings.outdir.join(format!("{prefix}-{number:04}.png"));
         image
             .save_with_format(&path, ImageFormat::Png)
@@ -307,3 +369,7 @@ pub(crate) fn blend_gray_pixel(image: &mut RgbaImage, x: u32, y: u32, shade: u8,
     output[3] = output_alpha as u8;
     *destination = Rgba(output);
 }
+
+#[cfg(test)]
+#[path = "render_ut.rs"]
+mod render_ut;

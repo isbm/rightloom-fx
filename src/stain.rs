@@ -3,9 +3,31 @@ use rand::Rng;
 
 use crate::render::{RenderError, RenderSettings, blend_gray_pixel, write_images};
 
+const MAX_SOFTNESS_FRACTION: f32 = 0.35;
+const TRANSITION_WIDTH_PER_SIGMA: f32 = 2.56;
+const MAX_WORKING_CELL_SIZE: f32 = 4.0;
+const BOX_BLUR_PASSES: usize = 3;
+const LIGHT_STAIN_LUMA: f32 = 230.0;
+const DARK_STAIN_LUMA: f32 = 20.0;
+
 #[derive(Debug, Clone)]
 pub struct StainSettings {
     pub render: RenderSettings,
+    pub blur: u8,
+    pub strength: u8,
+}
+
+impl StainSettings {
+    fn validate(&self) -> Result<(), RenderError> {
+        if self.blur > 100 {
+            return Err(RenderError::InvalidBlur(self.blur));
+        }
+        if self.strength > 100 {
+            return Err(RenderError::InvalidStrength(self.strength));
+        }
+
+        Ok(())
+    }
 }
 
 pub fn generate_images(settings: &StainSettings) -> Result<(), RenderError> {
@@ -17,6 +39,7 @@ fn generate_images_with_rng<R: Rng + ?Sized>(
     settings: &StainSettings,
     rng: &mut R,
 ) -> Result<(), RenderError> {
+    settings.validate()?;
     write_images(&settings.render, "stain", || render_image(settings, rng))
 }
 
@@ -39,8 +62,8 @@ fn render_image<R: Rng + ?Sized>(settings: &StainSettings, rng: &mut R) -> RgbaI
             * (0.04 + 0.12 * density_scale.sqrt())
             * rng.random_range(0.78..1.18);
         let anchor = choose_anchor(width, height, base_radius, &anchors, density_scale, rng);
-        let stain = Stain::new(anchor, base_radius, density_scale, rng);
-        stain.rasterize(&mut image);
+        let stain = Stain::new(anchor, base_radius, density_scale, settings.strength, rng);
+        stain.rasterize(&mut image, settings.blur);
         anchors.push(anchor);
     }
 
@@ -111,15 +134,28 @@ fn choose_anchor<R: Rng + ?Sized>(
 struct Stain {
     lobes: Vec<Lobe>,
     outline_field: CoarseField,
-    interior_field: CoarseField,
+    body_field: CoarseField,
+    body_variation_field: CoarseField,
+    tide: Option<TideMark>,
+    structures: Vec<DensityStructure>,
+    directional: Option<DirectionalDensity>,
     min_x: f32,
     max_x: f32,
     min_y: f32,
     max_y: f32,
+    characteristic_size: f32,
     outline_strength: f32,
     feather: f32,
     shade: u8,
     alpha: f32,
+}
+
+#[derive(Clone, Copy)]
+struct FieldBounds {
+    min_x: f32,
+    max_x: f32,
+    min_y: f32,
+    max_y: f32,
 }
 
 impl Stain {
@@ -127,6 +163,7 @@ impl Stain {
         anchor: (f32, f32),
         base_radius: f32,
         density_scale: f32,
+        strength: u8,
         rng: &mut R,
     ) -> Self {
         let lobe_count = rng.random_range(4..=7);
@@ -168,80 +205,447 @@ impl Stain {
             max_y = max_y.max(lobe.center_y + extent_y);
         }
 
+        let characteristic_size = (max_x - min_x).max(max_y - min_y).max(base_radius * 2.0);
         let field_margin = base_radius * 0.3;
         min_x -= field_margin;
         max_x += field_margin;
         min_y -= field_margin;
         max_y += field_margin;
+        let bounds = FieldBounds {
+            min_x,
+            max_x,
+            min_y,
+            max_y,
+        };
+
+        let outline_field = CoarseField::new(
+            min_x,
+            max_x,
+            min_y,
+            max_y,
+            (base_radius * rng.random_range(0.24..0.42)).max(12.0),
+            rng,
+        );
+        let body_field = CoarseField::new(
+            min_x,
+            max_x,
+            min_y,
+            max_y,
+            (base_radius * rng.random_range(0.15..0.28)).max(8.0),
+            rng,
+        );
+        let outline_strength = rng.random_range(0.11..0.2);
+        let feather = rng.random_range(0.07..0.15);
+        let shade = stain_luma(strength, rng.random_range(155..=235));
+        let alpha = (5.0 + 108.0 * density_scale.powf(0.72)) * rng.random_range(0.72..1.12);
+        let body_variation_field = CoarseField::new(
+            min_x,
+            max_x,
+            min_y,
+            max_y,
+            (base_radius * rng.random_range(0.42..0.8)).max(18.0),
+            rng,
+        );
+        let tide = TideMark::new(bounds, base_radius, feather, density_scale, rng);
+        let structures =
+            DensityStructure::new_many(&lobes, bounds, base_radius, density_scale, rng);
+        let directional = if rng.random_bool(0.65) {
+            Some(DirectionalDensity::new(anchor, base_radius, rng))
+        } else {
+            None
+        };
 
         Self {
-            outline_field: CoarseField::new(
-                min_x,
-                max_x,
-                min_y,
-                max_y,
-                (base_radius * rng.random_range(0.24..0.42)).max(12.0),
-                rng,
-            ),
-            interior_field: CoarseField::new(
-                min_x,
-                max_x,
-                min_y,
-                max_y,
-                (base_radius * rng.random_range(0.15..0.28)).max(8.0),
-                rng,
-            ),
+            outline_field,
+            body_field,
+            body_variation_field,
+            tide,
+            structures,
+            directional,
             lobes,
             min_x,
             max_x,
             min_y,
             max_y,
-            outline_strength: rng.random_range(0.11..0.2),
-            feather: rng.random_range(0.07..0.15),
-            shade: rng.random_range(155..=235),
-            alpha: (5.0 + 108.0 * density_scale.powf(0.72)) * rng.random_range(0.72..1.12),
+            characteristic_size,
+            outline_strength,
+            feather,
+            shade,
+            alpha,
         }
     }
 
-    fn rasterize(&self, image: &mut RgbaImage) {
-        let start_x = self.min_x.floor().max(0.0) as u32;
-        let end_x = self
-            .max_x
-            .ceil()
-            .min(image.width().saturating_sub(1) as f32) as u32;
-        let start_y = self.min_y.floor().max(0.0) as u32;
-        let end_y = self
-            .max_y
-            .ceil()
-            .min(image.height().saturating_sub(1) as f32) as u32;
-
-        if start_x > end_x || start_y > end_y {
-            return;
+    fn rasterize(&self, image: &mut RgbaImage, blur: u8) {
+        if blur == 0 {
+            self.rasterize_hard(image);
+        } else {
+            self.rasterize_diffused(image, blur);
         }
+    }
+
+    fn rasterize_hard(&self, image: &mut RgbaImage) {
+        let Some((start_x, end_x, start_y, end_y)) =
+            self.image_bounds(image, self.min_x, self.max_x, self.min_y, self.max_y)
+        else {
+            return;
+        };
 
         for y in start_y..=end_y {
             for x in start_x..=end_x {
-                let x = x as f32 + 0.5;
-                let y = y as f32 + 0.5;
-                let shape = self
-                    .lobes
-                    .iter()
-                    .map(|lobe| lobe.coverage(x, y))
-                    .fold(f32::NEG_INFINITY, f32::max);
-                let warped_shape = shape + self.outline_field.sample(x, y) * self.outline_strength;
+                let world_x = x as f32 + 0.5;
+                let world_y = y as f32 + 0.5;
+                let warped_shape = self.warped_shape_at(world_x, world_y);
                 let coverage = smoothstep(-self.feather, self.feather, warped_shape);
                 if coverage == 0.0 {
                     continue;
                 }
 
-                let mottle = 0.35 + 0.65 * smoothstep(-1.0, 1.0, self.interior_field.sample(x, y));
-                let alpha = (self.alpha * coverage * mottle).round().clamp(1.0, 255.0) as u8;
-                blend_gray_pixel(image, x as u32, y as u32, self.shade, alpha);
+                let alpha = (self.alpha
+                    * coverage
+                    * self.optical_density_at(warped_shape, world_x, world_y))
+                .round()
+                .clamp(1.0, 255.0) as u8;
+                blend_gray_pixel(image, x, y, self.shade, alpha);
             }
         }
     }
+
+    fn rasterize_diffused(&self, image: &mut RgbaImage, blur: u8) {
+        let mask = self.diffused_outer_mask(blur);
+
+        let Some((start_x, end_x, start_y, end_y)) = self.image_bounds(
+            image,
+            mask.min_x(),
+            mask.max_x(),
+            mask.min_y(),
+            mask.max_y(),
+        ) else {
+            return;
+        };
+
+        for y in start_y..=end_y {
+            for x in start_x..=end_x {
+                let world_x = x as f32 + 0.5;
+                let world_y = y as f32 + 0.5;
+                let coverage = mask.sample(world_x, world_y).clamp(0.0, 1.0);
+                if coverage == 0.0 {
+                    continue;
+                }
+
+                let warped_shape = self.warped_shape_at(world_x, world_y);
+                let alpha = (self.alpha
+                    * coverage
+                    * self
+                        .optical_density_at(warped_shape, world_x, world_y)
+                        .max(0.0))
+                .round()
+                .clamp(0.0, 255.0) as u8;
+                if alpha > 0 {
+                    blend_gray_pixel(image, x, y, self.shade, alpha);
+                }
+            }
+        }
+    }
+
+    fn diffused_outer_mask(&self, blur: u8) -> ScalarField {
+        let blur_fraction = f32::from(blur) / 100.0;
+        let transition_width = self.characteristic_size * blur_fraction * MAX_SOFTNESS_FRACTION;
+        let cell_size = (transition_width / 4.0).clamp(1.0, MAX_WORKING_CELL_SIZE);
+        let sigma_cells = transition_width / TRANSITION_WIDTH_PER_SIGMA / cell_size;
+        let blur_radius = box_blur_radius(sigma_cells);
+        let mut mask = self.outer_mask(cell_size, blur_radius);
+
+        // Three separable box passes give a broad Gaussian-like diffusion in linear time.
+        mask.blur_three_boxes(blur_radius);
+
+        mask
+    }
+
+    fn outer_mask(&self, cell_size: f32, blur_radius: usize) -> ScalarField {
+        let padding = (blur_radius * BOX_BLUR_PASSES) as f32 * cell_size + cell_size * 2.0;
+        let mut mask = ScalarField::new(
+            self.min_x - padding,
+            self.max_x + padding,
+            self.min_y - padding,
+            self.max_y + padding,
+            cell_size,
+        );
+
+        for y in 0..mask.height {
+            for x in 0..mask.width {
+                let (world_x, world_y) = mask.position(x, y);
+                let warped_shape = self.warped_shape_at(world_x, world_y);
+                mask.set(x, y, smoothstep(-self.feather, self.feather, warped_shape));
+            }
+        }
+
+        mask
+    }
+
+    fn image_bounds(
+        &self,
+        image: &RgbaImage,
+        min_x: f32,
+        max_x: f32,
+        min_y: f32,
+        max_y: f32,
+    ) -> Option<(u32, u32, u32, u32)> {
+        let last_x = image.width().saturating_sub(1) as f32;
+        let last_y = image.height().saturating_sub(1) as f32;
+        if max_x < 0.0 || max_y < 0.0 || min_x > last_x || min_y > last_y {
+            return None;
+        }
+
+        let start_x = min_x.floor().max(0.0) as u32;
+        let end_x = max_x.ceil().min(last_x) as u32;
+        let start_y = min_y.floor().max(0.0) as u32;
+        let end_y = max_y.ceil().min(last_y) as u32;
+
+        (start_x <= end_x && start_y <= end_y).then_some((start_x, end_x, start_y, end_y))
+    }
+
+    fn warped_shape_at(&self, x: f32, y: f32) -> f32 {
+        let shape = self
+            .lobes
+            .iter()
+            .map(|lobe| lobe.coverage(x, y))
+            .fold(f32::NEG_INFINITY, f32::max);
+
+        shape + self.outline_field.sample(x, y) * self.outline_strength
+    }
+
+    fn optical_density_at(&self, warped_shape: f32, x: f32, y: f32) -> f32 {
+        let broad_density = 0.45 + 0.35 * normalized_field(&self.body_field, x, y);
+        let secondary_density = 0.45 + 0.55 * normalized_field(&self.body_variation_field, x, y);
+        let structure_density: f32 = self
+            .structures
+            .iter()
+            .map(|structure| structure.density_at(x, y))
+            .sum();
+        let local_density =
+            (broad_density * secondary_density + structure_density).clamp(0.04, 1.35);
+        let tide_density = self
+            .tide
+            .as_ref()
+            .map_or(0.0, |tide| tide.density_at(warped_shape, x, y));
+        let directional_density = self
+            .directional
+            .as_ref()
+            .map_or(1.0, |directional| directional.multiplier_at(x, y));
+
+        (local_density + tide_density) * directional_density
+    }
 }
 
+struct TideMark {
+    field: CoarseField,
+    center: f32,
+    width: f32,
+    strength: f32,
+    presence_threshold: f32,
+    second_line: Option<TideLine>,
+}
+
+struct TideLine {
+    center_offset: f32,
+    width_scale: f32,
+    strength_scale: f32,
+    presence_threshold: f32,
+}
+
+impl TideMark {
+    fn new<R: Rng + ?Sized>(
+        bounds: FieldBounds,
+        base_radius: f32,
+        feather: f32,
+        density_scale: f32,
+        rng: &mut R,
+    ) -> Option<Self> {
+        if !rng.random_bool(0.42 + 0.4 * f64::from(density_scale)) {
+            return None;
+        }
+
+        let second_line = if rng.random_bool(0.18) {
+            Some(TideLine {
+                center_offset: rng.random_range(1.6..3.4),
+                width_scale: rng.random_range(0.55..0.9),
+                strength_scale: rng.random_range(0.18..0.42),
+                presence_threshold: rng.random_range(0.42..0.72),
+            })
+        } else {
+            None
+        };
+
+        Some(Self {
+            field: CoarseField::new(
+                bounds.min_x,
+                bounds.max_x,
+                bounds.min_y,
+                bounds.max_y,
+                (base_radius * rng.random_range(0.28..0.55)).max(14.0),
+                rng,
+            ),
+            center: feather * rng.random_range(0.65..2.0) + rng.random_range(0.0..0.045),
+            width: feather * rng.random_range(0.45..1.3),
+            strength: rng.random_range(0.16..0.46),
+            presence_threshold: rng.random_range(0.28..0.68),
+            second_line,
+        })
+    }
+
+    fn density_at(&self, boundary_distance: f32, x: f32, y: f32) -> f32 {
+        let variation = normalized_field(&self.field, x, y);
+        let local_center = self.center + (variation - 0.5) * self.width * 1.6;
+        let local_width = self.width * (0.45 + 0.9 * variation);
+        let presence = smoothstep(self.presence_threshold, 0.96, variation);
+        let mut density =
+            soft_band(boundary_distance, local_center, local_width) * presence * self.strength;
+
+        if let Some(second_line) = &self.second_line {
+            let second_presence = smoothstep(second_line.presence_threshold, 0.98, variation);
+            density += soft_band(
+                boundary_distance,
+                local_center + local_width * second_line.center_offset,
+                local_width * second_line.width_scale,
+            ) * second_presence
+                * self.strength
+                * second_line.strength_scale;
+        }
+
+        density
+    }
+}
+
+struct DensityStructure {
+    lobes: Vec<Lobe>,
+    field: CoarseField,
+    outline_strength: f32,
+    feather: f32,
+    strength: f32,
+}
+
+impl DensityStructure {
+    fn new_many<R: Rng + ?Sized>(
+        parent_lobes: &[Lobe],
+        bounds: FieldBounds,
+        base_radius: f32,
+        density_scale: f32,
+        rng: &mut R,
+    ) -> Vec<Self> {
+        let mut count = if rng.random_bool(0.22) {
+            0
+        } else if rng.random_bool(0.3 + 0.35 * f64::from(density_scale)) {
+            2
+        } else {
+            1
+        };
+        if density_scale > 0.65 && rng.random_bool(0.3) {
+            count += 1;
+        }
+
+        (0..count)
+            .map(|_| Self::new(parent_lobes, bounds, base_radius, rng))
+            .collect()
+    }
+
+    fn new<R: Rng + ?Sized>(
+        parent_lobes: &[Lobe],
+        bounds: FieldBounds,
+        base_radius: f32,
+        rng: &mut R,
+    ) -> Self {
+        let parent = parent_lobes[rng.random_range(0..parent_lobes.len())];
+        let structure_radius = base_radius * rng.random_range(0.42..0.95);
+        let branch_angle = rng.random_range(0.0..std::f32::consts::TAU);
+        let lobe_count = rng.random_range(2..=4);
+        let mut lobes = Vec::with_capacity(lobe_count);
+
+        for index in 0..lobe_count {
+            let direction = if index == 0 {
+                branch_angle
+            } else {
+                branch_angle + rng.random_range(-1.5..1.5)
+            };
+            let distance = if index == 0 {
+                0.0
+            } else {
+                structure_radius * rng.random_range(0.12..0.82)
+            };
+            lobes.push(Lobe {
+                center_x: parent.center_x
+                    + rng.random_range(-base_radius * 0.3..base_radius * 0.3)
+                    + direction.cos() * distance,
+                center_y: parent.center_y
+                    + rng.random_range(-base_radius * 0.3..base_radius * 0.3)
+                    + direction.sin() * distance,
+                radius_x: structure_radius * rng.random_range(0.5..1.2),
+                radius_y: structure_radius * rng.random_range(0.5..1.2),
+                angle: rng.random_range(0.0..std::f32::consts::TAU),
+            });
+        }
+
+        Self {
+            lobes,
+            field: CoarseField::new(
+                bounds.min_x,
+                bounds.max_x,
+                bounds.min_y,
+                bounds.max_y,
+                (structure_radius * rng.random_range(0.45..0.78)).max(12.0),
+                rng,
+            ),
+            outline_strength: rng.random_range(0.08..0.18),
+            feather: rng.random_range(0.13..0.27),
+            strength: if rng.random_bool(0.48) {
+                rng.random_range(0.08..0.24)
+            } else {
+                -rng.random_range(0.12..0.36)
+            },
+        }
+    }
+
+    fn density_at(&self, x: f32, y: f32) -> f32 {
+        let shape = self
+            .lobes
+            .iter()
+            .map(|lobe| lobe.coverage(x, y))
+            .fold(f32::NEG_INFINITY, f32::max);
+        let warped_shape = shape + self.field.sample(x, y) * self.outline_strength;
+        let coverage = smoothstep(-self.feather, self.feather, warped_shape);
+
+        self.strength * coverage * (0.45 + 0.55 * normalized_field(&self.field, x, y))
+    }
+}
+
+struct DirectionalDensity {
+    anchor: (f32, f32),
+    direction: (f32, f32),
+    span: f32,
+    strength: f32,
+}
+
+impl DirectionalDensity {
+    fn new<R: Rng + ?Sized>(anchor: (f32, f32), base_radius: f32, rng: &mut R) -> Self {
+        let angle = rng.random_range(0.0..std::f32::consts::TAU);
+
+        Self {
+            anchor,
+            direction: (angle.cos(), angle.sin()),
+            span: base_radius * 2.5,
+            strength: rng.random_range(0.08..0.18),
+        }
+    }
+
+    fn multiplier_at(&self, x: f32, y: f32) -> f32 {
+        let projection = ((x - self.anchor.0) * self.direction.0
+            + (y - self.anchor.1) * self.direction.1)
+            / self.span;
+
+        1.0 + self.strength * projection.clamp(-1.0, 1.0)
+    }
+}
+
+#[derive(Clone, Copy)]
 struct Lobe {
     center_x: f32,
     center_y: f32,
@@ -270,6 +674,165 @@ impl Lobe {
             (self.radius_x * sin).hypot(self.radius_y * cos),
         )
     }
+}
+
+struct ScalarField {
+    values: Vec<f32>,
+    width: usize,
+    height: usize,
+    origin_x: f32,
+    origin_y: f32,
+    cell_size: f32,
+}
+
+impl ScalarField {
+    fn new(min_x: f32, max_x: f32, min_y: f32, max_y: f32, cell_size: f32) -> Self {
+        let origin_x = (min_x / cell_size).floor() * cell_size;
+        let origin_y = (min_y / cell_size).floor() * cell_size;
+        let end_x = (max_x / cell_size).ceil() * cell_size;
+        let end_y = (max_y / cell_size).ceil() * cell_size;
+        let width = (((end_x - origin_x) / cell_size).round() as usize + 1).max(2);
+        let height = (((end_y - origin_y) / cell_size).round() as usize + 1).max(2);
+
+        Self {
+            values: vec![0.0; width * height],
+            width,
+            height,
+            origin_x,
+            origin_y,
+            cell_size,
+        }
+    }
+
+    fn position(&self, x: usize, y: usize) -> (f32, f32) {
+        (
+            self.origin_x + x as f32 * self.cell_size,
+            self.origin_y + y as f32 * self.cell_size,
+        )
+    }
+
+    fn set(&mut self, x: usize, y: usize, value: f32) {
+        self.values[y * self.width + x] = value;
+    }
+
+    fn min_x(&self) -> f32 {
+        self.origin_x
+    }
+
+    fn max_x(&self) -> f32 {
+        self.origin_x + (self.width - 1) as f32 * self.cell_size
+    }
+
+    fn min_y(&self) -> f32 {
+        self.origin_y
+    }
+
+    fn max_y(&self) -> f32 {
+        self.origin_y + (self.height - 1) as f32 * self.cell_size
+    }
+
+    fn sample(&self, x: f32, y: f32) -> f32 {
+        let grid_x = (x - self.origin_x) / self.cell_size;
+        let grid_y = (y - self.origin_y) / self.cell_size;
+        let x0 = grid_x.floor() as isize;
+        let y0 = grid_y.floor() as isize;
+        let horizontal = grid_x - x0 as f32;
+        let vertical = grid_y - y0 as f32;
+        let top = lerp(
+            self.value_or_zero(x0, y0),
+            self.value_or_zero(x0 + 1, y0),
+            horizontal,
+        );
+        let bottom = lerp(
+            self.value_or_zero(x0, y0 + 1),
+            self.value_or_zero(x0 + 1, y0 + 1),
+            horizontal,
+        );
+
+        lerp(top, bottom, vertical)
+    }
+
+    fn blur_three_boxes(&mut self, radius: usize) {
+        for _ in 0..BOX_BLUR_PASSES {
+            self.blur_horizontally(radius);
+            self.blur_vertically(radius);
+        }
+    }
+
+    fn blur_horizontally(&mut self, radius: usize) {
+        let mut output = vec![0.0; self.values.len()];
+        let width = radius * 2 + 1;
+        let divisor = width as f32;
+
+        for y in 0..self.height {
+            let row_start = y * self.width;
+            let mut sum: f32 = self.values[row_start..row_start + radius.min(self.width - 1) + 1]
+                .iter()
+                .sum();
+
+            for x in 0..self.width {
+                output[row_start + x] = sum / divisor;
+                if x >= radius {
+                    sum -= self.values[row_start + x - radius];
+                }
+                if x + radius + 1 < self.width {
+                    sum += self.values[row_start + x + radius + 1];
+                }
+            }
+        }
+
+        self.values = output;
+    }
+
+    fn blur_vertically(&mut self, radius: usize) {
+        let mut output = vec![0.0; self.values.len()];
+        let width = radius * 2 + 1;
+        let divisor = width as f32;
+
+        for x in 0..self.width {
+            let mut sum: f32 = (0..=radius.min(self.height - 1))
+                .map(|y| self.values[y * self.width + x])
+                .sum();
+
+            for y in 0..self.height {
+                output[y * self.width + x] = sum / divisor;
+                if y >= radius {
+                    sum -= self.values[(y - radius) * self.width + x];
+                }
+                if y + radius + 1 < self.height {
+                    sum += self.values[(y + radius + 1) * self.width + x];
+                }
+            }
+        }
+
+        self.values = output;
+    }
+
+    fn value_or_zero(&self, x: isize, y: isize) -> f32 {
+        if x < 0 || y < 0 || x >= self.width as isize || y >= self.height as isize {
+            return 0.0;
+        }
+
+        self.values[y as usize * self.width + x as usize]
+    }
+}
+
+fn box_blur_radius(sigma_cells: f32) -> usize {
+    let target_variance = sigma_cells * sigma_cells;
+    (((1.0 + 4.0 * target_variance).sqrt() - 1.0) * 0.5)
+        .ceil()
+        .max(1.0) as usize
+}
+
+fn stain_luma(strength: u8, shade_sample: u8) -> u8 {
+    let base_luma = lerp(
+        LIGHT_STAIN_LUMA,
+        DARK_STAIN_LUMA,
+        f32::from(strength) / 100.0,
+    );
+    let luma_variation = (f32::from(shade_sample) - 195.0) * 0.1;
+
+    (base_luma + luma_variation).round().clamp(0.0, 255.0) as u8
 }
 
 // A compact smooth field gives each stain a unique outline and uneven density.
@@ -327,6 +890,17 @@ impl CoarseField {
     }
 }
 
+fn normalized_field(field: &CoarseField, x: f32, y: f32) -> f32 {
+    smoothstep(-1.0, 1.0, field.sample(x, y))
+}
+
+fn soft_band(value: f32, center: f32, width: f32) -> f32 {
+    let leading = smoothstep(center - width, center - width * 0.25, value);
+    let trailing = 1.0 - smoothstep(center + width * 0.25, center + width, value);
+
+    leading * trailing
+}
+
 fn smoothstep(edge_start: f32, edge_end: f32, value: f32) -> f32 {
     let progress = ((value - edge_start) / (edge_end - edge_start)).clamp(0.0, 1.0);
     progress * progress * (3.0 - 2.0 * progress)
@@ -337,73 +911,5 @@ fn lerp(start: f32, end: f32, progress: f32) -> f32 {
 }
 
 #[cfg(test)]
-mod tests {
-    use std::collections::BTreeSet;
-
-    use super::{StainSettings, render_image};
-    use crate::render::{RenderSettings, Resolution};
-    use rand::{SeedableRng, rngs::StdRng};
-
-    fn settings(density: u8) -> StainSettings {
-        StainSettings {
-            render: RenderSettings {
-                resolution: Resolution::new(640, 400).expect("test resolution should be valid"),
-                density,
-                amount: 1,
-                outdir: "unused".into(),
-            },
-        }
-    }
-
-    #[test]
-    fn rendered_image_has_requested_dimensions() {
-        let mut rng = StdRng::seed_from_u64(10);
-        let image = render_image(&settings(30), &mut rng);
-
-        assert_eq!(image.dimensions(), (640, 400));
-    }
-
-    #[test]
-    fn zero_density_is_transparent() {
-        let mut rng = StdRng::seed_from_u64(11);
-        let image = render_image(&settings(0), &mut rng);
-
-        assert!(image.pixels().all(|pixel| pixel[3] == 0));
-    }
-
-    #[test]
-    fn nonzero_density_modifies_monochrome_pixels() {
-        let mut rng = StdRng::seed_from_u64(12);
-        let image = render_image(&settings(30), &mut rng);
-
-        assert!(image.pixels().any(|pixel| pixel[3] > 0));
-        assert!(
-            image
-                .pixels()
-                .filter(|pixel| pixel[3] > 0)
-                .all(|pixel| pixel[0] == pixel[1] && pixel[1] == pixel[2])
-        );
-    }
-
-    #[test]
-    fn generated_alpha_contains_variation() {
-        let mut rng = StdRng::seed_from_u64(13);
-        let image = render_image(&settings(45), &mut rng);
-        let alphas: BTreeSet<_> = image
-            .pixels()
-            .filter(|pixel| pixel[3] > 0)
-            .map(|pixel| pixel[3])
-            .collect();
-
-        assert!(alphas.len() > 4, "stains should have varied opacity");
-    }
-
-    #[test]
-    fn low_density_keeps_most_of_the_canvas_transparent() {
-        let mut rng = StdRng::seed_from_u64(14);
-        let image = render_image(&settings(5), &mut rng);
-        let transparent = image.pixels().filter(|pixel| pixel[3] == 0).count();
-
-        assert!(transparent * 100 / image.pixels().len() >= 70);
-    }
-}
+#[path = "stain_ut.rs"]
+mod stain_ut;

@@ -1,13 +1,10 @@
-use std::str::FromStr;
-
-#[cfg(test)]
-use std::ffi::OsString;
+use std::{ffi::OsString, str::FromStr};
 
 use clap::{Arg, ArgAction, ArgGroup, ArgMatches, Command as ClapCommand, builder::styling};
 use colored::Colorize;
 
 use crate::{
-    render::{RenderSettings, Resolution},
+    render::{ExportPolicy, RenderSettings, Resolution, RgbColor},
     scratches::ScratchType,
 };
 
@@ -33,15 +30,15 @@ pub(crate) struct ScratchesArgs {
 #[derive(Debug)]
 pub(crate) struct StainArgs {
     pub(crate) render: RenderSettings,
+    pub(crate) blur: u8,
+    pub(crate) strength: u8,
 }
 
 impl Cli {
     pub(crate) fn parse() -> Self {
-        let matches = cli().get_matches();
-        Self::from_matches(&matches)
+        Self::try_parse_from(std::env::args_os()).unwrap_or_else(|error| error.exit())
     }
 
-    #[cfg(test)]
     pub(crate) fn try_parse_from<I, T>(arguments: I) -> Result<Self, clap::Error>
     where
         I: IntoIterator<Item = T>,
@@ -67,6 +64,12 @@ impl Cli {
             }),
             "stain" => Command::Stain(StainArgs {
                 render: render_settings(arguments),
+                blur: *arguments
+                    .get_one("blur")
+                    .expect("clap supplies the stain blur default"),
+                strength: *arguments
+                    .get_one("strength")
+                    .expect("clap supplies the stain strength default"),
             }),
             _ => unreachable!("clap only exposes configured subcommands"),
         };
@@ -92,6 +95,15 @@ fn render_settings(arguments: &ArgMatches) -> RenderSettings {
             .get_one::<String>("outdir")
             .expect("clap requires an output directory")
             .into(),
+        export_policy: if arguments.get_flag("alpha") {
+            ExportPolicy::PreserveAlpha
+        } else {
+            arguments
+                .get_one::<RgbColor>("background")
+                .copied()
+                .map(ExportPolicy::Flatten)
+                .unwrap_or_default()
+        },
     }
 }
 
@@ -105,7 +117,7 @@ pub(crate) fn cli() -> ClapCommand {
     ClapCommand::new(APP_NAME)
         .version(env!("CARGO_PKG_VERSION"))
         .about(format!(
-            "{} - generate transparent film-effect overlays",
+            "{} - generate film-effect overlays",
             APP_NAME.bright_magenta().bold()
         ))
         .arg_required_else_help(true)
@@ -120,7 +132,7 @@ fn scratches_command(styles: styling::Styles) -> ClapCommand {
     let types = ScratchType::names().join(", ");
     shared_render_arguments(
         ClapCommand::new("scratches")
-            .about("Generate transparent PNG overlays of physical film defects")
+            .about("Generate PNG overlays of physical film defects")
             .styles(styles)
             .arg(
                 Arg::new("type")
@@ -148,8 +160,26 @@ fn scratches_command(styles: styling::Styles) -> ClapCommand {
 fn stain_command(styles: styling::Styles) -> ClapCommand {
     shared_render_arguments(
         ClapCommand::new("stain")
-            .about("Generate transparent PNG overlays of analog-film development stains")
-            .styles(styles),
+            .about("Generate PNG overlays of analog-film development stains")
+            .styles(styles)
+            .arg(
+                Arg::new("blur")
+                    .short('b')
+                    .long("blur")
+                    .value_name("PERCENT")
+                    .help("Stain edge softness, 0-100.\n0 = hard edges, 100 = maximum diffusion.")
+                    .default_value("50")
+                    .value_parser(parse_blur),
+            )
+            .arg(
+                Arg::new("strength")
+                    .short('s')
+                    .long("strength")
+                    .value_name("PERCENT")
+                    .help("Stain darkness, 0-100.\n0 = very light, 100 = very dark.")
+                    .default_value("50")
+                    .value_parser(parse_strength),
+            ),
     )
 }
 
@@ -200,6 +230,21 @@ fn shared_render_arguments(command: ClapCommand) -> ClapCommand {
                 .help("Directory for numbered PNG outputs")
                 .required(true),
         )
+        .arg(
+            Arg::new("alpha")
+                .long("alpha")
+                .help("Preserve RGBA transparency instead of flattening onto black")
+                .action(ArgAction::SetTrue)
+                .conflicts_with("background"),
+        )
+        .arg(
+            Arg::new("background")
+                .long("background")
+                .value_name("RRGGBB")
+                .help("Flatten transparency onto a six-digit RGB hex color instead of black")
+                .value_parser(parse_background)
+                .conflicts_with("alpha"),
+        )
         .group(
             ArgGroup::new("dimensions")
                 .args(["resolution", "aspect-ratio"])
@@ -228,6 +273,43 @@ pub(crate) fn parse_density(value: &str) -> Result<u8, String> {
     Ok(density as u8)
 }
 
+pub(crate) fn parse_blur(value: &str) -> Result<u8, String> {
+    let blur = value
+        .parse::<u16>()
+        .map_err(|_| "blur must be an integer between 0 and 100".to_owned())?;
+
+    if blur > 100 {
+        return Err("blur must be between 0 and 100".to_owned());
+    }
+
+    Ok(blur as u8)
+}
+
+pub(crate) fn parse_strength(value: &str) -> Result<u8, String> {
+    let strength = value
+        .parse::<u16>()
+        .map_err(|_| "strength must be an integer between 0 and 100".to_owned())?;
+
+    if strength > 100 {
+        return Err("strength must be between 0 and 100".to_owned());
+    }
+
+    Ok(strength as u8)
+}
+
+pub(crate) fn parse_background(value: &str) -> Result<RgbColor, String> {
+    let digits = value.strip_prefix('#').unwrap_or(value);
+    if digits.len() != 6 || !digits.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err("background must be exactly six hexadecimal RGB digits".to_owned());
+    }
+
+    let red = u8::from_str_radix(&digits[0..2], 16).expect("validated hexadecimal red channel");
+    let green = u8::from_str_radix(&digits[2..4], 16).expect("validated hexadecimal green channel");
+    let blue = u8::from_str_radix(&digits[4..6], 16).expect("validated hexadecimal blue channel");
+
+    Ok(RgbColor::new(red, green, blue))
+}
+
 pub(crate) fn parse_scratch_type(value: &str) -> Result<ScratchType, String> {
     ScratchType::from_str(value)
 }
@@ -245,161 +327,5 @@ pub(crate) fn parse_amount(value: &str) -> Result<u32, String> {
 }
 
 #[cfg(test)]
-mod tests {
-    use std::str::FromStr;
-
-    use super::{Cli, Command, cli, parse_amount, parse_density, parse_scratch_type};
-    use crate::scratches::{Resolution, ScratchType};
-
-    #[test]
-    fn resolution_parses_dimensions() {
-        let resolution = Resolution::from_str("3840x2160").expect("resolution should parse");
-
-        assert_eq!(resolution.width(), 3840);
-        assert_eq!(resolution.height(), 2160);
-    }
-
-    #[test]
-    fn malformed_resolutions_are_rejected() {
-        for value in ["3840", "3840x", "x2160", "3840x2160x1", "wide x tall"] {
-            assert!(Resolution::from_str(value).is_err(), "{value} should fail");
-        }
-
-        assert!(Resolution::from_str("0x2160").is_err());
-        assert!(Resolution::from_str("3840x0").is_err());
-    }
-
-    #[test]
-    fn density_is_limited_to_a_percentage() {
-        assert_eq!(parse_density("0"), Ok(0));
-        assert_eq!(parse_density("100"), Ok(100));
-        assert!(parse_density("101").is_err());
-        assert!(parse_density("-1").is_err());
-    }
-
-    #[test]
-    fn amount_must_be_positive() {
-        assert_eq!(parse_amount("1"), Ok(1));
-        assert!(parse_amount("0").is_err());
-    }
-
-    #[test]
-    fn scratch_types_are_parsed_and_validated() {
-        assert_eq!(parse_scratch_type("dust"), Ok(ScratchType::Dust));
-        assert_eq!(parse_scratch_type("camera"), Ok(ScratchType::Camera));
-        assert_eq!(parse_scratch_type("bend"), Ok(ScratchType::Bend));
-        assert!(parse_scratch_type("unknown").is_err());
-    }
-
-    #[test]
-    fn cli_rejects_unknown_scratch_types() {
-        let result = Cli::try_parse_from([
-            "rightloom-fx",
-            "scratches",
-            "-r",
-            "320x200",
-            "-d",
-            "10",
-            "-t",
-            "unknown",
-            "-a",
-            "1",
-            "-o",
-            "output",
-        ]);
-
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn stain_cli_accepts_exact_resolution() {
-        let cli = Cli::try_parse_from([
-            "rightloom-fx",
-            "stain",
-            "-r",
-            "6240x4160",
-            "-d",
-            "10",
-            "-a",
-            "1",
-            "-o",
-            "output",
-        ])
-        .expect("exact resolution should parse");
-        let resolution = match cli.command {
-            Command::Stain(args) => args.render.resolution,
-            Command::Scratches(_) => panic!("stain command should parse as stain"),
-        };
-
-        assert_eq!((resolution.width(), resolution.height()), (6240, 4160));
-    }
-
-    #[test]
-    fn stain_cli_accepts_aspect_ratio_resolution() {
-        let cli = Cli::try_parse_from([
-            "rightloom-fx",
-            "stain",
-            "-R",
-            "2:3x6240",
-            "-d",
-            "10",
-            "-a",
-            "1",
-            "-o",
-            "output",
-        ])
-        .expect("aspect ratio should parse");
-        let resolution = match cli.command {
-            Command::Stain(args) => args.render.resolution,
-            Command::Scratches(_) => panic!("stain command should parse as stain"),
-        };
-
-        assert_eq!((resolution.width(), resolution.height()), (4160, 6240));
-    }
-
-    #[test]
-    fn cli_requires_exactly_one_dimension_input() {
-        let neither = Cli::try_parse_from([
-            "rightloom-fx",
-            "stain",
-            "-d",
-            "10",
-            "-a",
-            "1",
-            "-o",
-            "output",
-        ]);
-        let both = Cli::try_parse_from([
-            "rightloom-fx",
-            "stain",
-            "-r",
-            "6240x4160",
-            "-R",
-            "3:2x6240",
-            "-d",
-            "10",
-            "-a",
-            "1",
-            "-o",
-            "output",
-        ]);
-
-        assert!(neither.is_err());
-        assert!(both.is_err());
-    }
-
-    #[test]
-    fn scratches_help_lists_supported_types() {
-        let command = cli();
-        let error = command
-            .try_get_matches_from(["rightloom-fx", "scratches", "--help"])
-            .expect_err("help should short-circuit parsing");
-        let help = error.to_string();
-
-        assert!(help.contains("dust"));
-        assert!(help.contains("camera"));
-        assert!(help.contains("bend"));
-        assert!(help.contains("3:2x6240"));
-        assert!(help.contains("21:9"));
-    }
-}
+#[path = "cli_ut.rs"]
+mod cli_ut;
