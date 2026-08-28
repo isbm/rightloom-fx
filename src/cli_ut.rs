@@ -1,8 +1,8 @@
 use std::str::FromStr;
 
 use super::{
-    Cli, Command, cli, parse_amount, parse_background, parse_blur, parse_density,
-    parse_scratch_type, parse_strength,
+    Cli, Command, cli, parse_amount, parse_background, parse_blur, parse_density, parse_lightness,
+    parse_scratch_type,
 };
 use crate::render::{ExportPolicy, RgbColor};
 use crate::scratches::{Resolution, ScratchType};
@@ -45,14 +45,14 @@ fn blur_is_limited_to_a_percentage() {
 }
 
 #[test]
-fn strength_is_limited_to_a_percentage() {
-    assert_eq!(parse_strength("0"), Ok(0));
-    assert_eq!(parse_strength("1"), Ok(1));
-    assert_eq!(parse_strength("50"), Ok(50));
-    assert_eq!(parse_strength("99"), Ok(99));
-    assert_eq!(parse_strength("100"), Ok(100));
-    assert!(parse_strength("101").is_err());
-    assert!(parse_strength("-1").is_err());
+fn lightness_is_limited_to_a_percentage() {
+    for value in ["0", "1", "10", "25", "50", "75", "99", "100"] {
+        let parsed = parse_lightness(value).expect("in-range lightness should parse");
+        assert_eq!(parsed, value.parse().expect("test value should be numeric"));
+    }
+
+    assert!(parse_lightness("101").is_err());
+    assert!(parse_lightness("-1").is_err());
 }
 
 #[test]
@@ -118,11 +118,11 @@ fn stain_cli_accepts_exact_resolution() {
         "output",
     ])
     .expect("exact resolution should parse");
-    let (resolution, blur, strength, export_policy) = match cli.command {
+    let (resolution, blur, lightness, export_policy) = match cli.command {
         Command::Stain(args) => (
             args.render.resolution,
             args.blur,
-            args.strength,
+            args.lightness,
             args.render.export_policy,
         ),
         Command::Scratches(_) => panic!("stain command should parse as stain"),
@@ -130,7 +130,7 @@ fn stain_cli_accepts_exact_resolution() {
 
     assert_eq!((resolution.width(), resolution.height()), (6240, 4160));
     assert_eq!(blur, 50);
-    assert_eq!(strength, 50);
+    assert_eq!(lightness, 10);
     assert_eq!(export_policy, ExportPolicy::Flatten(RgbColor::BLACK));
 }
 
@@ -145,7 +145,7 @@ fn stain_cli_accepts_aspect_ratio_resolution() {
         "10",
         "-b",
         "100",
-        "-s",
+        "-l",
         "100",
         "--background=ffffff",
         "-a",
@@ -154,11 +154,11 @@ fn stain_cli_accepts_aspect_ratio_resolution() {
         "output",
     ])
     .expect("aspect ratio should parse");
-    let (resolution, blur, strength, export_policy) = match cli.command {
+    let (resolution, blur, lightness, export_policy) = match cli.command {
         Command::Stain(args) => (
             args.render.resolution,
             args.blur,
-            args.strength,
+            args.lightness,
             args.render.export_policy,
         ),
         Command::Scratches(_) => panic!("stain command should parse as stain"),
@@ -166,7 +166,7 @@ fn stain_cli_accepts_aspect_ratio_resolution() {
 
     assert_eq!((resolution.width(), resolution.height()), (4160, 6240));
     assert_eq!(blur, 100);
-    assert_eq!(strength, 100);
+    assert_eq!(lightness, 100);
     assert_eq!(
         export_policy,
         ExportPolicy::Flatten(RgbColor::new(255, 255, 255))
@@ -245,7 +245,7 @@ fn scratches_help_lists_supported_types() {
 }
 
 #[test]
-fn stain_help_documents_blur_and_strength() {
+fn stain_help_documents_blur_and_lightness() {
     let command = cli();
     let error = command
         .try_get_matches_from(["rightloom-fx", "stain", "--help"])
@@ -255,12 +255,24 @@ fn stain_help_documents_blur_and_strength() {
     assert!(help.contains("-b, --blur <PERCENT>"));
     assert!(help.contains("Stain edge softness, 0-100."));
     assert!(help.contains("0 = hard edges, 100 = maximum diffusion."));
-    assert!(help.contains("-s, --strength <PERCENT>"));
-    assert!(help.contains("Stain darkness, 0-100."));
-    assert!(help.contains("0 = very light, 100 = very dark."));
-    assert!(help.contains("[default: 50]"));
+    assert!(help.contains("-l, --lightness <PERCENT>"));
+    assert!(help.contains("Stain brightness, 0-100."));
+    assert!(help.contains("10 matches the current/default appearance."));
+    assert!(help.contains("0 = nearly black, 100 = near-white."));
+    assert!(help.contains("[default: 10]"));
     assert!(help.contains("--alpha"));
     assert!(help.contains("--background <RRGGBB>"));
+}
+
+#[test]
+fn scratches_help_does_not_expose_lightness() {
+    let command = cli();
+    let error = command
+        .try_get_matches_from(["rightloom-fx", "scratches", "--help"])
+        .expect_err("help should short-circuit parsing");
+    let help = error.to_string();
+
+    assert!(!help.contains("--lightness"));
 }
 
 #[test]
@@ -307,7 +319,7 @@ fn scratches_reject_stain_blur() {
 }
 
 #[test]
-fn scratches_reject_stain_strength() {
+fn scratches_reject_stain_lightness() {
     let result = Cli::try_parse_from([
         "rightloom-fx",
         "scratches",
@@ -317,7 +329,7 @@ fn scratches_reject_stain_strength() {
         "10",
         "-t",
         "dust",
-        "-s",
+        "-l",
         "50",
         "-a",
         "1",
@@ -349,7 +361,7 @@ fn stain_rejects_out_of_range_blur() {
 }
 
 #[test]
-fn stain_rejects_out_of_range_strength() {
+fn stain_rejects_out_of_range_lightness() {
     let result = Cli::try_parse_from([
         "rightloom-fx",
         "stain",
@@ -357,7 +369,7 @@ fn stain_rejects_out_of_range_strength() {
         "320x200",
         "-d",
         "10",
-        "-s",
+        "-l",
         "101",
         "-a",
         "1",

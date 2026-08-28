@@ -90,7 +90,7 @@ fn stain_command_writes_requested_number_of_pngs() {
         "10",
         "-b",
         "75",
-        "-s",
+        "-l",
         "25",
         "-a",
         "3",

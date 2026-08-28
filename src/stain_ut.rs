@@ -3,10 +3,12 @@ use std::collections::BTreeSet;
 use image::RgbaImage;
 use rand::{SeedableRng, rngs::StdRng};
 
-use super::{Stain, StainSettings, generate_images_with_rng, render_image, smoothstep};
+use super::{
+    Stain, StainSettings, generate_images_with_rng, lightness_luma, render_image, smoothstep,
+};
 use crate::render::{ExportPolicy, RenderError, RenderSettings, Resolution};
 
-fn settings(density: u8, blur: u8, strength: u8) -> StainSettings {
+fn settings(density: u8, blur: u8, lightness: u8) -> StainSettings {
     StainSettings {
         render: RenderSettings {
             resolution: Resolution::new(640, 400).expect("test resolution should be valid"),
@@ -16,14 +18,45 @@ fn settings(density: u8, blur: u8, strength: u8) -> StainSettings {
             export_policy: ExportPolicy::default(),
         },
         blur,
-        strength,
+        lightness,
+    }
+}
+
+#[test]
+fn lightness_calibration_points_match() {
+    for (lightness, expected) in [
+        (0, 0.0),
+        (10, 25.0),
+        (25, 70.0),
+        (50, 140.0),
+        (75, 205.0),
+        (100, 255.0),
+    ] {
+        assert_eq!(lightness_luma(lightness), expected, "lightness {lightness}");
+    }
+}
+
+#[test]
+fn lightness_interpolates_between_calibration_points() {
+    for (lightness, expected) in [(5, 12.5), (17, 46.0), (30, 84.0), (60, 166.0), (90, 235.0)] {
+        assert_eq!(lightness_luma(lightness), expected, "lightness {lightness}");
+    }
+}
+
+#[test]
+fn lightness_mapping_is_monotonic() {
+    for lightness in 0..100 {
+        assert!(
+            lightness_luma(lightness) <= lightness_luma(lightness + 1),
+            "lightness {lightness}"
+        );
     }
 }
 
 #[test]
 fn rendered_image_has_requested_dimensions() {
     let mut rng = StdRng::seed_from_u64(10);
-    let image = render_image(&settings(30, 50, 50), &mut rng);
+    let image = render_image(&settings(30, 50, 10), &mut rng);
 
     assert_eq!(image.dimensions(), (640, 400));
 }
@@ -32,7 +65,7 @@ fn rendered_image_has_requested_dimensions() {
 fn zero_density_is_transparent() {
     for (seed, blur) in [(11, 0), (12, 100)] {
         let mut rng = StdRng::seed_from_u64(seed);
-        let image = render_image(&settings(0, blur, 50), &mut rng);
+        let image = render_image(&settings(0, blur, 10), &mut rng);
 
         assert!(image.pixels().all(|pixel| pixel[3] == 0));
     }
@@ -41,7 +74,7 @@ fn zero_density_is_transparent() {
 #[test]
 fn nonzero_density_modifies_monochrome_pixels() {
     let mut rng = StdRng::seed_from_u64(12);
-    let image = render_image(&settings(30, 50, 50), &mut rng);
+    let image = render_image(&settings(30, 50, 10), &mut rng);
 
     assert!(image.pixels().any(|pixel| pixel[3] > 0));
     assert!(
@@ -83,14 +116,14 @@ fn generated_alpha_has_broad_density_variation() {
         *composited_lumas.last().expect("stains should be visible")
             - *composited_lumas.first().expect("stains should be visible")
             >= 8,
-        "high-strength stains should retain visible internal variation"
+        "high-lightness stains should retain visible internal variation"
     );
 }
 
 #[test]
 fn low_density_keeps_most_of_the_canvas_transparent() {
     let mut rng = StdRng::seed_from_u64(14);
-    let image = render_image(&settings(5, 50, 50), &mut rng);
+    let image = render_image(&settings(5, 50, 10), &mut rng);
     let transparent = image.pixels().filter(|pixel| pixel[3] == 0).count();
 
     assert!(transparent * 100 / image.pixels().len() >= 70);
@@ -99,7 +132,7 @@ fn low_density_keeps_most_of_the_canvas_transparent() {
 #[test]
 fn invalid_blur_is_rejected_before_output_is_created() {
     let mut rng = StdRng::seed_from_u64(15);
-    let error = generate_images_with_rng(&settings(30, 101, 50), &mut rng)
+    let error = generate_images_with_rng(&settings(30, 101, 10), &mut rng)
         .expect_err("out-of-range blur should fail validation");
 
     assert!(matches!(error, RenderError::InvalidBlur(101)));
@@ -108,15 +141,15 @@ fn invalid_blur_is_rejected_before_output_is_created() {
 #[test]
 fn increasing_blur_broadens_the_transition() {
     let mut hard_rng = StdRng::seed_from_u64(16);
-    let hard = render_image(&settings(45, 0, 50), &mut hard_rng);
+    let hard = render_image(&settings(45, 0, 10), &mut hard_rng);
     let mut blur_25_rng = StdRng::seed_from_u64(16);
-    let blur_25 = render_image(&settings(45, 25, 50), &mut blur_25_rng);
+    let blur_25 = render_image(&settings(45, 25, 10), &mut blur_25_rng);
     let mut blur_50_rng = StdRng::seed_from_u64(16);
-    let blur_50 = render_image(&settings(45, 50, 50), &mut blur_50_rng);
+    let blur_50 = render_image(&settings(45, 50, 10), &mut blur_50_rng);
     let mut blur_75_rng = StdRng::seed_from_u64(16);
-    let blur_75 = render_image(&settings(45, 75, 50), &mut blur_75_rng);
+    let blur_75 = render_image(&settings(45, 75, 10), &mut blur_75_rng);
     let mut blur_100_rng = StdRng::seed_from_u64(16);
-    let blur_100 = render_image(&settings(45, 100, 50), &mut blur_100_rng);
+    let blur_100 = render_image(&settings(45, 100, 10), &mut blur_100_rng);
 
     let footprint = |image: &image::RgbaImage| image.pixels().filter(|pixel| pixel[3] > 0).count();
     let low_alpha = |image: &image::RgbaImage| {
@@ -140,7 +173,7 @@ fn increasing_blur_broadens_the_transition() {
 #[test]
 fn diffused_alpha_uses_only_the_blurred_outer_mask() {
     let mut rng = StdRng::seed_from_u64(17);
-    let stain = Stain::new((320.0, 200.0), 100.0, 0.45, 50, &mut rng);
+    let stain = Stain::new((320.0, 200.0), 100.0, 0.45, 10, &mut rng);
     let mask = stain.diffused_outer_mask(50);
     let mut image = RgbaImage::new(640, 400);
     stain.rasterize_diffused(&mut image, 50);
@@ -179,46 +212,63 @@ fn diffused_alpha_uses_only_the_blurred_outer_mask() {
 }
 
 #[test]
-fn invalid_strength_is_rejected_before_output_is_created() {
+fn invalid_lightness_is_rejected_before_output_is_created() {
     let mut rng = StdRng::seed_from_u64(18);
     let error = generate_images_with_rng(&settings(30, 50, 101), &mut rng)
-        .expect_err("out-of-range strength should fail validation");
+        .expect_err("out-of-range lightness should fail validation");
 
-    assert!(matches!(error, RenderError::InvalidStrength(101)));
+    assert!(matches!(error, RenderError::InvalidLightness(101)));
 }
 
 #[test]
-fn strength_changes_luma_without_changing_alpha_or_dimensions() {
-    let mut light_rng = StdRng::seed_from_u64(19);
-    let light = render_image(&settings(45, 75, 0), &mut light_rng);
-    let mut medium_rng = StdRng::seed_from_u64(19);
-    let medium = render_image(&settings(45, 75, 50), &mut medium_rng);
-    let mut dark_rng = StdRng::seed_from_u64(19);
-    let dark = render_image(&settings(45, 75, 100), &mut dark_rng);
+fn lightness_never_changes_alpha_geometry_or_blur() {
+    let mut low_rng = StdRng::seed_from_u64(19);
+    let low = render_image(&settings(45, 80, 10), &mut low_rng);
+    let mut mid_rng = StdRng::seed_from_u64(19);
+    let mid = render_image(&settings(45, 80, 50), &mut mid_rng);
+    let mut high_rng = StdRng::seed_from_u64(19);
+    let high = render_image(&settings(45, 80, 100), &mut high_rng);
 
-    assert_eq!(light.dimensions(), medium.dimensions());
-    assert_eq!(medium.dimensions(), dark.dimensions());
+    assert_eq!(low.dimensions(), mid.dimensions());
+    assert_eq!(mid.dimensions(), high.dimensions());
 
-    for ((light_pixel, medium_pixel), dark_pixel) in
-        light.pixels().zip(medium.pixels()).zip(dark.pixels())
-    {
-        assert_eq!(light_pixel[3], medium_pixel[3]);
-        assert_eq!(medium_pixel[3], dark_pixel[3]);
+    for ((low_pixel, mid_pixel), high_pixel) in low.pixels().zip(mid.pixels()).zip(high.pixels()) {
+        assert_eq!(low_pixel[3], mid_pixel[3]);
+        assert_eq!(mid_pixel[3], high_pixel[3]);
     }
+}
 
-    let average_luma = |image: &image::RgbaImage| {
+#[test]
+fn average_luma_increases_with_lightness() {
+    let average_luma = |lightness: u8| {
+        let mut rng = StdRng::seed_from_u64(20);
+        let image = render_image(&settings(45, 50, lightness), &mut rng);
         let visible: Vec<_> = image.pixels().filter(|pixel| pixel[3] > 0).collect();
         visible.iter().map(|pixel| u64::from(pixel[0])).sum::<u64>() as f64 / visible.len() as f64
     };
 
-    let light_luma = average_luma(&light);
-    let medium_luma = average_luma(&medium);
-    let dark_luma = average_luma(&dark);
+    let lumas: Vec<_> = [10, 25, 50, 75, 100]
+        .into_iter()
+        .map(average_luma)
+        .collect();
 
-    assert!((220.0..=235.0).contains(&light_luma));
-    assert!((115.0..=135.0).contains(&medium_luma));
-    assert!((15.0..=30.0).contains(&dark_luma));
-    assert!(light_luma > medium_luma);
-    assert!(medium_luma > dark_luma);
-    assert!(light.pixels().any(|pixel| pixel[3] > 0));
+    for window in lumas.windows(2) {
+        assert!(window[0] < window[1], "lumas should increase: {lumas:?}");
+    }
+}
+
+#[test]
+fn lightness_keeps_internal_luma_variation() {
+    let mut rng = StdRng::seed_from_u64(21);
+    let image = render_image(&settings(45, 50, 50), &mut rng);
+    let visible_lumas: BTreeSet<_> = image
+        .pixels()
+        .filter(|pixel| pixel[3] > 0)
+        .map(|pixel| pixel[0])
+        .collect();
+
+    assert!(
+        visible_lumas.len() > 1,
+        "internal cloudy variation should remain"
+    );
 }
