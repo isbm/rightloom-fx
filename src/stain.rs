@@ -8,6 +8,16 @@ const TRANSITION_WIDTH_PER_SIGMA: f32 = 2.56;
 const MAX_WORKING_CELL_SIZE: f32 = 4.0;
 const BOX_BLUR_PASSES: usize = 3;
 const DENSITY_EVALUATION_THRESHOLD: f32 = 0.0001;
+const TIDE_PRESENCE_ANCHORS: [(u8, f64); 6] = [
+    (0, 0.0),
+    (10, 0.05),
+    (25, 0.08),
+    (50, 0.12),
+    (75, 0.16),
+    (100, 0.20),
+];
+const SECOND_TIDE_LINE_PROBABILITY: f64 = 0.0;
+const MAX_TIDE_RELATIVE_MODULATION: f32 = 0.10;
 const DENSITY_ALPHA_ANCHORS: [(u8, f32); 8] = [
     (0, 0.0),
     (5, 18.0),
@@ -273,7 +283,7 @@ impl Stain {
             (base_radius * rng.random_range(0.42..0.8)).max(18.0),
             rng,
         );
-        let tide = TideMark::new(bounds, base_radius, feather, density_scale, rng);
+        let tide = TideMark::new(bounds, base_radius, feather, density, rng);
         let structures =
             DensityStructure::new_many(&lobes, bounds, base_radius, density_scale, rng);
         let directional = if rng.random_bool(0.65) {
@@ -442,6 +452,17 @@ impl Stain {
     }
 
     fn optical_density_at(&self, warped_shape: f32, x: f32, y: f32) -> f32 {
+        let local_density = self.local_density_at(x, y);
+        let tide_density = self.tide_contribution_at(warped_shape, x, y, local_density);
+        let directional_density = self
+            .directional
+            .as_ref()
+            .map_or(1.0, |directional| directional.multiplier_at(x, y));
+
+        (local_density + tide_density) * directional_density
+    }
+
+    fn local_density_at(&self, x: f32, y: f32) -> f32 {
         let broad_density = 0.45 + 0.35 * normalized_density_field(&self.body_field, x, y);
         let secondary_density =
             0.45 + 0.55 * normalized_density_field(&self.body_variation_field, x, y);
@@ -450,18 +471,16 @@ impl Stain {
             .iter()
             .map(|structure| structure.density_at(x, y))
             .sum();
-        let local_density =
-            (broad_density * secondary_density + structure_density).clamp(0.20, 1.35);
+        (broad_density * secondary_density + structure_density).clamp(0.20, 1.35)
+    }
+
+    fn tide_contribution_at(&self, warped_shape: f32, x: f32, y: f32, local_density: f32) -> f32 {
         let tide_density = self
             .tide
             .as_ref()
             .map_or(0.0, |tide| tide.density_at(warped_shape, x, y));
-        let directional_density = self
-            .directional
-            .as_ref()
-            .map_or(1.0, |directional| directional.multiplier_at(x, y));
 
-        (local_density + tide_density) * directional_density
+        bounded_tide_contribution(tide_density, local_density)
     }
 }
 
@@ -486,14 +505,16 @@ impl TideMark {
         bounds: FieldBounds,
         base_radius: f32,
         feather: f32,
-        density_scale: f32,
+        density: u8,
         rng: &mut R,
     ) -> Option<Self> {
-        if !rng.random_bool(0.42 + 0.4 * f64::from(density_scale)) {
+        if !rng.random_bool(tide_presence_probability(density)) {
             return None;
         }
 
-        let second_line = if rng.random_bool(0.18) {
+        let second_line = if SECOND_TIDE_LINE_PROBABILITY > 0.0
+            && rng.random_bool(SECOND_TIDE_LINE_PROBABILITY)
+        {
             Some(TideLine {
                 center_offset: rng.random_range(1.6..3.4),
                 width_scale: rng.random_range(0.55..0.9),
@@ -514,17 +535,17 @@ impl TideMark {
                 rng,
             ),
             center: feather * rng.random_range(0.65..2.0) + rng.random_range(0.0..0.045),
-            width: feather * rng.random_range(0.45..1.3),
-            strength: rng.random_range(0.16..0.46),
-            presence_threshold: rng.random_range(0.28..0.68),
+            width: feather * rng.random_range(1.8..3.2),
+            strength: rng.random_range(0.02..0.10),
+            presence_threshold: rng.random_range(0.45..0.72),
             second_line,
         })
     }
 
     fn density_at(&self, boundary_distance: f32, x: f32, y: f32) -> f32 {
         let variation = normalized_density_field(&self.field, x, y);
-        let local_center = self.center + (variation - 0.5) * self.width * 1.6;
-        let local_width = self.width * (0.45 + 0.9 * variation);
+        let local_center = self.center + (variation - 0.5) * self.width * 0.8;
+        let local_width = self.width * (0.85 + 0.65 * variation);
         let presence = smoothstep(self.presence_threshold, 0.96, variation);
         let mut density =
             soft_band(boundary_distance, local_center, local_width) * presence * self.strength;
@@ -540,8 +561,12 @@ impl TideMark {
                 * second_line.strength_scale;
         }
 
-        density
+        density.clamp(0.0, self.strength)
     }
+}
+
+fn bounded_tide_contribution(tide_density: f32, local_density: f32) -> f32 {
+    tide_density.clamp(0.0, local_density * MAX_TIDE_RELATIVE_MODULATION)
 }
 
 struct DensityStructure {
@@ -880,6 +905,18 @@ fn density_base_alpha(density: u8) -> f32 {
     )
 }
 
+fn tide_presence_probability(density: u8) -> f64 {
+    let density = f64::from(density);
+    let (start, end) = TIDE_PRESENCE_ANCHORS
+        .windows(2)
+        .find(|segment| density <= f64::from(segment[1].0))
+        .map(|segment| (segment[0], segment[1]))
+        .unwrap_or((TIDE_PRESENCE_ANCHORS[4], TIDE_PRESENCE_ANCHORS[5]));
+
+    (start.1 + (end.1 - start.1) * (density - f64::from(start.0)) / f64::from(end.0 - start.0))
+        .clamp(0.0, 1.0)
+}
+
 fn lightness_luma(lightness: u8) -> f32 {
     let lightness = f32::from(lightness);
     let (start, end) = LIGHTNESS_ANCHORS
@@ -1033,10 +1070,9 @@ fn normalized_density_value(value: f32) -> f32 {
 }
 
 fn soft_band(value: f32, center: f32, width: f32) -> f32 {
-    let leading = smoothstep(center - width, center - width * 0.25, value);
-    let trailing = 1.0 - smoothstep(center + width * 0.25, center + width, value);
+    let distance = (value - center).abs();
 
-    leading * trailing
+    1.0 - smoothstep(width * 0.15, width, distance)
 }
 
 fn smoothstep(edge_start: f32, edge_end: f32, value: f32) -> f32 {

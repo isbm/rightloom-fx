@@ -4,8 +4,10 @@ use image::RgbaImage;
 use rand::{Rng, SeedableRng, rngs::StdRng};
 
 use super::{
-    CoarseField, DensityField, Stain, StainSettings, density_base_alpha, generate_images_with_rng,
-    lightness_luma, render_image, smoothstep,
+    CoarseField, DensityField, FieldBounds, MAX_TIDE_RELATIVE_MODULATION,
+    SECOND_TIDE_LINE_PROBABILITY, Stain, StainSettings, TideMark, bounded_tide_contribution,
+    density_base_alpha, generate_images_with_rng, lightness_luma, render_image, smoothstep,
+    tide_presence_probability,
 };
 use crate::render::{ExportPolicy, RenderError, RenderSettings, Resolution};
 
@@ -49,6 +51,46 @@ fn alpha_statistics(image: &RgbaImage) -> (f64, u8) {
         .expect("test image should have pixels");
 
     (alpha_sum as f64 / image.pixels().len() as f64, maximum)
+}
+
+fn tide_bounds() -> FieldBounds {
+    FieldBounds {
+        min_x: 0.0,
+        max_x: 640.0,
+        min_y: 0.0,
+        max_y: 400.0,
+    }
+}
+
+fn tide_presence_sequence(seed: u64, density: u8) -> Vec<bool> {
+    let mut rng = StdRng::seed_from_u64(seed);
+
+    (0..96)
+        .map(|_| TideMark::new(tide_bounds(), 100.0, 0.1, density, &mut rng).is_some())
+        .collect()
+}
+
+fn seeded_tide_mark(density: u8) -> TideMark {
+    for seed in 0..1_000 {
+        let mut rng = StdRng::seed_from_u64(seed);
+        if let Some(tide) = TideMark::new(tide_bounds(), 100.0, 0.1, density, &mut rng) {
+            return tide;
+        }
+    }
+
+    panic!("a seeded tide mark should be found");
+}
+
+fn seeded_stain_with_tide() -> Stain {
+    for seed in 0..1_000 {
+        let mut rng = StdRng::seed_from_u64(seed);
+        let stain = Stain::new((320.0, 200.0), 100.0, 100, 1.0, 100, &mut rng);
+        if stain.tide.is_some() {
+            return stain;
+        }
+    }
+
+    panic!("a seeded high-density stain should contain a tide mark");
 }
 
 fn normalized_alpha_bounds(image: &RgbaImage, minimum_alpha: u8) -> (f32, f32, f32, f32) {
@@ -116,6 +158,109 @@ fn density_alpha_mapping_is_monotonic() {
             "density {density}"
         );
     }
+}
+
+#[test]
+fn tide_presence_probability_uses_the_calibrated_monotonic_curve() {
+    for (density, expected) in [
+        (0, 0.0),
+        (10, 0.05),
+        (25, 0.08),
+        (50, 0.12),
+        (75, 0.16),
+        (100, 0.20),
+    ] {
+        assert!(
+            (tide_presence_probability(density) - expected).abs() < 0.000_001,
+            "density {density}"
+        );
+    }
+
+    for density in 0..100 {
+        assert!(
+            tide_presence_probability(density) <= tide_presence_probability(density + 1),
+            "density {density}"
+        );
+    }
+}
+
+#[test]
+fn tide_creation_is_deterministic_with_a_seeded_rng() {
+    assert_eq!(
+        tide_presence_sequence(27, 100),
+        tide_presence_sequence(27, 100)
+    );
+}
+
+#[test]
+fn second_tide_line_is_disabled() {
+    assert_eq!(SECOND_TIDE_LINE_PROBABILITY, 0.0);
+    assert!(seeded_tide_mark(10).second_line.is_none());
+    assert!(seeded_tide_mark(100).second_line.is_none());
+}
+
+#[test]
+fn tide_marks_have_bounded_modulation() {
+    let tide = seeded_tide_mark(100);
+    assert!((0.02..=0.10).contains(&tide.strength));
+
+    let mut maximum_density = 0.0_f32;
+    for y in (0..=400).step_by(8) {
+        for x in (0..=640).step_by(8) {
+            maximum_density = maximum_density.max(tide.density_at(tide.center, x as f32, y as f32));
+        }
+    }
+    assert!(maximum_density <= tide.strength + f32::EPSILON);
+
+    assert_close(bounded_tide_contribution(0.10, 0.20), 0.02);
+    assert_close(bounded_tide_contribution(0.10, 1.35), 0.10);
+}
+
+#[test]
+fn high_density_stain_keeps_a_broad_body_without_tide_dominance() {
+    let stain = seeded_stain_with_tide();
+    let mut maximum_relative_tide = 0.0_f32;
+
+    for y in (0..400).step_by(4) {
+        for x in (0..640).step_by(4) {
+            let world_x = x as f32 + 0.5;
+            let world_y = y as f32 + 0.5;
+            let local_density = stain.local_density_at(world_x, world_y);
+            let tide_density = stain.tide_contribution_at(
+                stain.warped_shape_at(world_x, world_y),
+                world_x,
+                world_y,
+                local_density,
+            );
+            let relative_tide = tide_density / local_density;
+            maximum_relative_tide = maximum_relative_tide.max(relative_tide);
+
+            assert!(
+                relative_tide <= MAX_TIDE_RELATIVE_MODULATION + f32::EPSILON,
+                "tide contribution should remain bounded relative to the body"
+            );
+        }
+    }
+
+    assert!(maximum_relative_tide <= MAX_TIDE_RELATIVE_MODULATION + f32::EPSILON);
+
+    let mut rng = StdRng::seed_from_u64(28);
+    let image = render_image(&settings(100, 50, 100), &mut rng);
+    let strong_pixels = image.pixels().filter(|pixel| pixel[3] >= 64).count();
+    let visible_alphas: BTreeSet<_> = image
+        .pixels()
+        .filter(|pixel| pixel[3] >= 16)
+        .map(|pixel| pixel[3])
+        .collect();
+
+    assert!(
+        strong_pixels > image.pixels().len() / 100,
+        "high density should retain a broad strong body"
+    );
+    assert!(
+        visible_alphas.len() > 16,
+        "high density should retain cloudy internal variation"
+    );
 }
 
 #[test]
