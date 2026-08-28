@@ -12,10 +12,12 @@ struct TestOutputDir(PathBuf);
 impl TestOutputDir {
     fn new() -> Self {
         let number = TEMP_DIRECTORY_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!(
-            "rightloom-fx-progress-test-{}-{number}",
-            process::id()
-        ));
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join(".tmp")
+            .join(format!(
+                "rightloom-fx-progress-test-{}-{number}",
+                process::id()
+            ));
         fs::create_dir_all(&path).expect("temporary output directory should be created");
         Self(path)
     }

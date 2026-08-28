@@ -8,12 +8,23 @@ const TRANSITION_WIDTH_PER_SIGMA: f32 = 2.56;
 const MAX_WORKING_CELL_SIZE: f32 = 4.0;
 const BOX_BLUR_PASSES: usize = 3;
 const DENSITY_EVALUATION_THRESHOLD: f32 = 0.0001;
-const LIGHTNESS_ANCHORS: [(u8, f32); 6] = [
+const DENSITY_ALPHA_ANCHORS: [(u8, f32); 8] = [
     (0, 0.0),
-    (10, 25.0),
-    (25, 70.0),
-    (50, 140.0),
-    (75, 205.0),
+    (5, 18.0),
+    (10, 35.0),
+    (25, 75.0),
+    (50, 145.0),
+    (70, 195.0),
+    (85, 225.0),
+    (100, 250.0),
+];
+const LIGHTNESS_ANCHORS: [(u8, f32); 7] = [
+    (0, 0.0),
+    (10, 30.0),
+    (25, 100.0),
+    (50, 190.0),
+    (70, 230.0),
+    (80, 245.0),
     (100, 255.0),
 ];
 
@@ -69,7 +80,14 @@ fn render_image<R: Rng + ?Sized>(settings: &StainSettings, rng: &mut R) -> RgbaI
             * (0.04 + 0.12 * density_scale.sqrt())
             * rng.random_range(0.78..1.18);
         let anchor = choose_anchor(width, height, base_radius, &anchors, density_scale, rng);
-        let stain = Stain::new(anchor, base_radius, density_scale, settings.lightness, rng);
+        let stain = Stain::new(
+            anchor,
+            base_radius,
+            density,
+            density_scale,
+            settings.lightness,
+            rng,
+        );
         stain.rasterize(&mut image, settings.blur);
         anchors.push(anchor);
     }
@@ -169,6 +187,7 @@ impl Stain {
     fn new<R: Rng + ?Sized>(
         anchor: (f32, f32),
         base_radius: f32,
+        density: u8,
         density_scale: f32,
         lightness: u8,
         rng: &mut R,
@@ -244,7 +263,8 @@ impl Stain {
         let outline_strength = rng.random_range(0.11..0.2);
         let feather = rng.random_range(0.07..0.15);
         let shade = stain_luma(lightness, rng.random_range(155..=235));
-        let alpha = (5.0 + 108.0 * density_scale.powf(0.72)) * rng.random_range(0.72..1.12);
+        let base_alpha = density_base_alpha(density);
+        let alpha = (base_alpha * rng.random_range(0.90..1.10)).clamp(0.0, 255.0);
         let body_variation_field = DensityField::new(
             min_x,
             max_x,
@@ -431,7 +451,7 @@ impl Stain {
             .map(|structure| structure.density_at(x, y))
             .sum();
         let local_density =
-            (broad_density * secondary_density + structure_density).clamp(0.04, 1.35);
+            (broad_density * secondary_density + structure_density).clamp(0.20, 1.35);
         let tide_density = self
             .tide
             .as_ref()
@@ -845,13 +865,28 @@ fn box_blur_radius(sigma_cells: f32) -> usize {
         .max(1.0) as usize
 }
 
+fn density_base_alpha(density: u8) -> f32 {
+    let density = f32::from(density);
+    let (start, end) = DENSITY_ALPHA_ANCHORS
+        .windows(2)
+        .find(|segment| density <= f32::from(segment[1].0))
+        .map(|segment| (segment[0], segment[1]))
+        .unwrap_or((DENSITY_ALPHA_ANCHORS[6], DENSITY_ALPHA_ANCHORS[7]));
+
+    lerp(
+        start.1,
+        end.1,
+        (density - f32::from(start.0)) / f32::from(end.0 - start.0),
+    )
+}
+
 fn lightness_luma(lightness: u8) -> f32 {
     let lightness = f32::from(lightness);
     let (start, end) = LIGHTNESS_ANCHORS
         .windows(2)
         .find(|segment| lightness <= f32::from(segment[1].0))
         .map(|segment| (segment[0], segment[1]))
-        .unwrap_or((LIGHTNESS_ANCHORS[4], LIGHTNESS_ANCHORS[5]));
+        .unwrap_or((LIGHTNESS_ANCHORS[5], LIGHTNESS_ANCHORS[6]));
 
     lerp(
         start.1,

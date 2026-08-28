@@ -4,8 +4,8 @@ use image::RgbaImage;
 use rand::{Rng, SeedableRng, rngs::StdRng};
 
 use super::{
-    CoarseField, DensityField, Stain, StainSettings, generate_images_with_rng, lightness_luma,
-    render_image, smoothstep,
+    CoarseField, DensityField, Stain, StainSettings, density_base_alpha, generate_images_with_rng,
+    lightness_luma, render_image, smoothstep,
 };
 use crate::render::{ExportPolicy, RenderError, RenderSettings, Resolution};
 
@@ -31,6 +31,24 @@ fn settings_with_resolution(
         blur,
         lightness,
     }
+}
+
+fn assert_close(actual: f32, expected: f32) {
+    assert!(
+        (actual - expected).abs() < 0.001,
+        "expected {expected}, got {actual}"
+    );
+}
+
+fn alpha_statistics(image: &RgbaImage) -> (f64, u8) {
+    let alpha_sum: u64 = image.pixels().map(|pixel| u64::from(pixel[3])).sum();
+    let maximum = image
+        .pixels()
+        .map(|pixel| pixel[3])
+        .max()
+        .expect("test image should have pixels");
+
+    (alpha_sum as f64 / image.pixels().len() as f64, maximum)
 }
 
 fn normalized_alpha_bounds(image: &RgbaImage, minimum_alpha: u8) -> (f32, f32, f32, f32) {
@@ -60,23 +78,72 @@ fn normalized_alpha_bounds(image: &RgbaImage, minimum_alpha: u8) -> (f32, f32, f
 }
 
 #[test]
+fn density_alpha_calibration_points_match() {
+    for (density, expected) in [
+        (0, 0.0),
+        (5, 18.0),
+        (10, 35.0),
+        (25, 75.0),
+        (50, 145.0),
+        (70, 195.0),
+        (85, 225.0),
+        (100, 250.0),
+    ] {
+        assert_close(density_base_alpha(density), expected);
+    }
+}
+
+#[test]
+fn density_alpha_interpolates_between_calibration_points() {
+    for (density, expected) in [
+        (2, 7.2),
+        (7, 24.8),
+        (15, 48.333_332),
+        (40, 117.0),
+        (60, 170.0),
+        (77, 209.0),
+        (92, 236.666_67),
+    ] {
+        assert_close(density_base_alpha(density), expected);
+    }
+}
+
+#[test]
+fn density_alpha_mapping_is_monotonic() {
+    for density in 0..100 {
+        assert!(
+            density_base_alpha(density) <= density_base_alpha(density + 1),
+            "density {density}"
+        );
+    }
+}
+
+#[test]
 fn lightness_calibration_points_match() {
     for (lightness, expected) in [
         (0, 0.0),
-        (10, 25.0),
-        (25, 70.0),
-        (50, 140.0),
-        (75, 205.0),
+        (10, 30.0),
+        (25, 100.0),
+        (50, 190.0),
+        (70, 230.0),
+        (80, 245.0),
         (100, 255.0),
     ] {
-        assert_eq!(lightness_luma(lightness), expected, "lightness {lightness}");
+        assert_close(lightness_luma(lightness), expected);
     }
 }
 
 #[test]
 fn lightness_interpolates_between_calibration_points() {
-    for (lightness, expected) in [(5, 12.5), (17, 46.0), (30, 84.0), (60, 166.0), (90, 235.0)] {
-        assert_eq!(lightness_luma(lightness), expected, "lightness {lightness}");
+    for (lightness, expected) in [
+        (5, 15.0),
+        (17, 62.666_668),
+        (30, 118.0),
+        (60, 210.0),
+        (75, 237.5),
+        (90, 250.0),
+    ] {
+        assert_close(lightness_luma(lightness), expected);
     }
 }
 
@@ -111,9 +178,9 @@ fn seeded_rendering_is_deterministic() {
 #[test]
 fn seeded_stain_preserves_normalized_macro_structure_across_resolutions() {
     let mut small_rng = StdRng::seed_from_u64(23);
-    let small_stain = Stain::new((400.0, 300.0), 100.0, 0.45, 50, &mut small_rng);
+    let small_stain = Stain::new((400.0, 300.0), 100.0, 45, 0.45, 50, &mut small_rng);
     let mut large_rng = StdRng::seed_from_u64(23);
-    let large_stain = Stain::new((800.0, 600.0), 200.0, 0.45, 50, &mut large_rng);
+    let large_stain = Stain::new((800.0, 600.0), 200.0, 45, 0.45, 50, &mut large_rng);
 
     assert_eq!(small_stain.lobes.len(), large_stain.lobes.len());
     for (small_lobe, large_lobe) in small_stain.lobes.iter().zip(&large_stain.lobes) {
@@ -150,7 +217,7 @@ fn seeded_stain_preserves_normalized_macro_structure_across_resolutions() {
 #[test]
 fn internal_density_has_many_distinct_final_resolution_values() {
     let mut rng = StdRng::seed_from_u64(24);
-    let stain = Stain::new((320.0, 200.0), 100.0, 0.45, 50, &mut rng);
+    let stain = Stain::new((320.0, 200.0), 100.0, 45, 0.45, 50, &mut rng);
     let lobe = stain.lobes[0];
     let mut densities = BTreeSet::new();
 
@@ -256,6 +323,26 @@ fn nonzero_density_modifies_monochrome_pixels() {
 }
 
 #[test]
+fn density_70_has_substantially_higher_mean_and_peak_alpha_than_density_25() {
+    let mut lower_density_rng = StdRng::seed_from_u64(26);
+    let lower_density = render_image(&settings(25, 50, 80), &mut lower_density_rng);
+    let mut higher_density_rng = StdRng::seed_from_u64(26);
+    let higher_density = render_image(&settings(70, 50, 80), &mut higher_density_rng);
+
+    let (lower_mean, lower_peak) = alpha_statistics(&lower_density);
+    let (higher_mean, higher_peak) = alpha_statistics(&higher_density);
+
+    assert!(
+        higher_mean > lower_mean * 1.5,
+        "density 70 should have substantially higher mean alpha ({higher_mean} vs {lower_mean})"
+    );
+    assert!(
+        higher_peak > lower_peak,
+        "density 70 should have a higher peak alpha ({higher_peak} vs {lower_peak})"
+    );
+}
+
+#[test]
 fn generated_alpha_has_broad_density_variation() {
     let mut rng = StdRng::seed_from_u64(13);
     let image = render_image(&settings(45, 0, 100), &mut rng);
@@ -343,7 +430,7 @@ fn increasing_blur_broadens_the_transition() {
 #[test]
 fn diffused_alpha_uses_only_the_blurred_outer_mask() {
     let mut rng = StdRng::seed_from_u64(17);
-    let stain = Stain::new((320.0, 200.0), 100.0, 0.45, 10, &mut rng);
+    let stain = Stain::new((320.0, 200.0), 100.0, 45, 0.45, 10, &mut rng);
     let mask = stain.diffused_outer_mask(50);
     let mut image = RgbaImage::new(640, 400);
     stain.rasterize_diffused(&mut image, 50);
