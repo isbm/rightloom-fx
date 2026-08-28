@@ -1,17 +1,28 @@
 use std::collections::BTreeSet;
 
 use image::RgbaImage;
-use rand::{SeedableRng, rngs::StdRng};
+use rand::{Rng, SeedableRng, rngs::StdRng};
 
 use super::{
-    Stain, StainSettings, generate_images_with_rng, lightness_luma, render_image, smoothstep,
+    CoarseField, DensityField, Stain, StainSettings, generate_images_with_rng, lightness_luma,
+    render_image, smoothstep,
 };
 use crate::render::{ExportPolicy, RenderError, RenderSettings, Resolution};
 
 fn settings(density: u8, blur: u8, lightness: u8) -> StainSettings {
+    settings_with_resolution(640, 400, density, blur, lightness)
+}
+
+fn settings_with_resolution(
+    width: u32,
+    height: u32,
+    density: u8,
+    blur: u8,
+    lightness: u8,
+) -> StainSettings {
     StainSettings {
         render: RenderSettings {
-            resolution: Resolution::new(640, 400).expect("test resolution should be valid"),
+            resolution: Resolution::new(width, height).expect("test resolution should be valid"),
             density,
             amount: 1,
             outdir: "unused".into(),
@@ -20,6 +31,32 @@ fn settings(density: u8, blur: u8, lightness: u8) -> StainSettings {
         blur,
         lightness,
     }
+}
+
+fn normalized_alpha_bounds(image: &RgbaImage, minimum_alpha: u8) -> (f32, f32, f32, f32) {
+    let mut min_x = image.width();
+    let mut max_x = 0;
+    let mut min_y = image.height();
+    let mut max_y = 0;
+
+    for (x, y, pixel) in image.enumerate_pixels() {
+        if pixel[3] < minimum_alpha {
+            continue;
+        }
+
+        min_x = min_x.min(x);
+        max_x = max_x.max(x);
+        min_y = min_y.min(y);
+        max_y = max_y.max(y);
+    }
+
+    assert!(min_x <= max_x && min_y <= max_y, "stain should be visible");
+    (
+        min_x as f32 / image.width() as f32,
+        max_x as f32 / image.width() as f32,
+        min_y as f32 / image.height() as f32,
+        max_y as f32 / image.height() as f32,
+    )
 }
 
 #[test]
@@ -56,9 +93,142 @@ fn lightness_mapping_is_monotonic() {
 #[test]
 fn rendered_image_has_requested_dimensions() {
     let mut rng = StdRng::seed_from_u64(10);
-    let image = render_image(&settings(30, 50, 10), &mut rng);
+    let image = render_image(&settings_with_resolution(960, 640, 30, 50, 10), &mut rng);
 
-    assert_eq!(image.dimensions(), (640, 400));
+    assert_eq!(image.dimensions(), (960, 640));
+}
+
+#[test]
+fn seeded_rendering_is_deterministic() {
+    let mut first_rng = StdRng::seed_from_u64(22);
+    let first = render_image(&settings(45, 80, 50), &mut first_rng);
+    let mut second_rng = StdRng::seed_from_u64(22);
+    let second = render_image(&settings(45, 80, 50), &mut second_rng);
+
+    assert_eq!(first, second);
+}
+
+#[test]
+fn seeded_stain_preserves_normalized_macro_structure_across_resolutions() {
+    let mut small_rng = StdRng::seed_from_u64(23);
+    let small_stain = Stain::new((400.0, 300.0), 100.0, 0.45, 50, &mut small_rng);
+    let mut large_rng = StdRng::seed_from_u64(23);
+    let large_stain = Stain::new((800.0, 600.0), 200.0, 0.45, 50, &mut large_rng);
+
+    assert_eq!(small_stain.lobes.len(), large_stain.lobes.len());
+    for (small_lobe, large_lobe) in small_stain.lobes.iter().zip(&large_stain.lobes) {
+        assert!((small_lobe.center_x / 800.0 - large_lobe.center_x / 1600.0).abs() < 0.0001);
+        assert!((small_lobe.center_y / 600.0 - large_lobe.center_y / 1200.0).abs() < 0.0001);
+        assert!((small_lobe.radius_x / 800.0 - large_lobe.radius_x / 1600.0).abs() < 0.0001);
+        assert!((small_lobe.radius_y / 600.0 - large_lobe.radius_y / 1200.0).abs() < 0.0001);
+    }
+
+    let mut small_image = RgbaImage::new(800, 600);
+    small_stain.rasterize(&mut small_image, 80);
+    let mut large_image = RgbaImage::new(1600, 1200);
+    large_stain.rasterize(&mut large_image, 80);
+
+    let small_bounds = normalized_alpha_bounds(&small_image, 4);
+    let large_bounds = normalized_alpha_bounds(&large_image, 4);
+    for (small, large) in [
+        small_bounds.0,
+        small_bounds.1,
+        small_bounds.2,
+        small_bounds.3,
+    ]
+    .into_iter()
+    .zip([
+        large_bounds.0,
+        large_bounds.1,
+        large_bounds.2,
+        large_bounds.3,
+    ]) {
+        assert!((small - large).abs() < 0.025);
+    }
+}
+
+#[test]
+fn internal_density_has_many_distinct_final_resolution_values() {
+    let mut rng = StdRng::seed_from_u64(24);
+    let stain = Stain::new((320.0, 200.0), 100.0, 0.45, 50, &mut rng);
+    let lobe = stain.lobes[0];
+    let mut densities = BTreeSet::new();
+
+    for offset_y in -24..=24 {
+        for offset_x in -24..=24 {
+            let x = lobe.center_x + offset_x as f32 + 0.5;
+            let y = lobe.center_y + offset_y as f32 + 0.5;
+            let shape = stain.warped_shape_at(x, y);
+            if shape > 0.0 {
+                densities
+                    .insert((stain.optical_density_at(shape, x, y) * 100_000.0).round() as i32);
+            }
+        }
+    }
+
+    assert!(
+        densities.len() > 64,
+        "final-resolution density should retain broad continuous variation"
+    );
+}
+
+#[test]
+fn density_field_does_not_repeat_flat_control_cells() {
+    let width = 6;
+    let height = 6;
+    let mut values = Vec::with_capacity(width * height);
+    for y in 0..height {
+        for x in 0..width {
+            let is_flat_center = (2..=3).contains(&x) && (2..=3).contains(&y);
+            values.push(if is_flat_center {
+                0.0
+            } else {
+                (x as f32 - 2.5) * 0.4 + (y as f32 - 2.5) * 0.2
+            });
+        }
+    }
+    let field = DensityField {
+        control: CoarseField {
+            values,
+            width,
+            height,
+            origin_x: 0.0,
+            origin_y: 0.0,
+            cell_size: 16.0,
+        },
+    };
+    let mut samples = BTreeSet::new();
+
+    for y in 32..48 {
+        for x in 32..48 {
+            samples.insert(
+                (field.sample(x as f32 + 0.5, y as f32 + 0.5) * 1_000_000.0).round() as i32,
+            );
+        }
+    }
+
+    assert!(
+        samples.len() > 64,
+        "density should vary inside a control cell instead of creating a repeated rectangle"
+    );
+}
+
+#[test]
+fn density_sampling_does_not_consume_rng() {
+    let mut sampled_rng = StdRng::seed_from_u64(25);
+    let sampled_field = DensityField::new(0.0, 256.0, 0.0, 256.0, 16.0, &mut sampled_rng);
+    for y in 0..64 {
+        for x in 0..64 {
+            let _ = sampled_field.sample(x as f32 + 0.5, y as f32 + 0.5);
+        }
+    }
+    let sampled_next = sampled_rng.random::<u64>();
+
+    let mut untouched_rng = StdRng::seed_from_u64(25);
+    let _untouched_field = DensityField::new(0.0, 256.0, 0.0, 256.0, 16.0, &mut untouched_rng);
+    let untouched_next = untouched_rng.random::<u64>();
+
+    assert_eq!(sampled_next, untouched_next);
 }
 
 #[test]
