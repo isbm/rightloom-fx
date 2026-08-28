@@ -7,6 +7,7 @@ const MAX_SOFTNESS_FRACTION: f32 = 0.35;
 const TRANSITION_WIDTH_PER_SIGMA: f32 = 2.56;
 const MAX_WORKING_CELL_SIZE: f32 = 4.0;
 const BOX_BLUR_PASSES: usize = 3;
+const DENSITY_EVALUATION_THRESHOLD: f32 = 0.0001;
 const LIGHTNESS_ANCHORS: [(u8, f32); 6] = [
     (0, 0.0),
     (10, 25.0),
@@ -140,8 +141,8 @@ fn choose_anchor<R: Rng + ?Sized>(
 struct Stain {
     lobes: Vec<Lobe>,
     outline_field: CoarseField,
-    body_field: CoarseField,
-    body_variation_field: CoarseField,
+    body_field: DensityField,
+    body_variation_field: DensityField,
     tide: Option<TideMark>,
     structures: Vec<DensityStructure>,
     directional: Option<DirectionalDensity>,
@@ -190,13 +191,13 @@ impl Stain {
             let radius_x = base_radius * rng.random_range(0.58..1.3);
             let radius_y = base_radius * rng.random_range(0.58..1.3);
             let angle = rng.random_range(0.0..std::f32::consts::TAU);
-            lobes.push(Lobe {
-                center_x: anchor.0 + direction.cos() * distance,
-                center_y: anchor.1 + direction.sin() * distance,
+            lobes.push(Lobe::new(
+                anchor.0 + direction.cos() * distance,
+                anchor.1 + direction.sin() * distance,
                 radius_x,
                 radius_y,
                 angle,
-            });
+            ));
         }
 
         let mut min_x = f32::INFINITY;
@@ -232,7 +233,7 @@ impl Stain {
             (base_radius * rng.random_range(0.24..0.42)).max(12.0),
             rng,
         );
-        let body_field = CoarseField::new(
+        let body_field = DensityField::new(
             min_x,
             max_x,
             min_y,
@@ -244,7 +245,7 @@ impl Stain {
         let feather = rng.random_range(0.07..0.15);
         let shade = stain_luma(lightness, rng.random_range(155..=235));
         let alpha = (5.0 + 108.0 * density_scale.powf(0.72)) * rng.random_range(0.72..1.12);
-        let body_variation_field = CoarseField::new(
+        let body_variation_field = DensityField::new(
             min_x,
             max_x,
             min_y,
@@ -334,7 +335,7 @@ impl Stain {
                 let world_x = x as f32 + 0.5;
                 let world_y = y as f32 + 0.5;
                 let coverage = mask.sample(world_x, world_y).clamp(0.0, 1.0);
-                if coverage == 0.0 {
+                if coverage <= DENSITY_EVALUATION_THRESHOLD {
                     continue;
                 }
 
@@ -421,8 +422,9 @@ impl Stain {
     }
 
     fn optical_density_at(&self, warped_shape: f32, x: f32, y: f32) -> f32 {
-        let broad_density = 0.45 + 0.35 * normalized_field(&self.body_field, x, y);
-        let secondary_density = 0.45 + 0.55 * normalized_field(&self.body_variation_field, x, y);
+        let broad_density = 0.45 + 0.35 * normalized_density_field(&self.body_field, x, y);
+        let secondary_density =
+            0.45 + 0.55 * normalized_density_field(&self.body_variation_field, x, y);
         let structure_density: f32 = self
             .structures
             .iter()
@@ -444,7 +446,7 @@ impl Stain {
 }
 
 struct TideMark {
-    field: CoarseField,
+    field: DensityField,
     center: f32,
     width: f32,
     strength: f32,
@@ -483,7 +485,7 @@ impl TideMark {
         };
 
         Some(Self {
-            field: CoarseField::new(
+            field: DensityField::new(
                 bounds.min_x,
                 bounds.max_x,
                 bounds.min_y,
@@ -500,7 +502,7 @@ impl TideMark {
     }
 
     fn density_at(&self, boundary_distance: f32, x: f32, y: f32) -> f32 {
-        let variation = normalized_field(&self.field, x, y);
+        let variation = normalized_density_field(&self.field, x, y);
         let local_center = self.center + (variation - 0.5) * self.width * 1.6;
         let local_width = self.width * (0.45 + 0.9 * variation);
         let presence = smoothstep(self.presence_threshold, 0.96, variation);
@@ -524,7 +526,7 @@ impl TideMark {
 
 struct DensityStructure {
     lobes: Vec<Lobe>,
-    field: CoarseField,
+    field: DensityField,
     outline_strength: f32,
     feather: f32,
     strength: f32,
@@ -577,22 +579,22 @@ impl DensityStructure {
             } else {
                 structure_radius * rng.random_range(0.12..0.82)
             };
-            lobes.push(Lobe {
-                center_x: parent.center_x
+            lobes.push(Lobe::new(
+                parent.center_x
                     + rng.random_range(-base_radius * 0.3..base_radius * 0.3)
                     + direction.cos() * distance,
-                center_y: parent.center_y
+                parent.center_y
                     + rng.random_range(-base_radius * 0.3..base_radius * 0.3)
                     + direction.sin() * distance,
-                radius_x: structure_radius * rng.random_range(0.5..1.2),
-                radius_y: structure_radius * rng.random_range(0.5..1.2),
-                angle: rng.random_range(0.0..std::f32::consts::TAU),
-            });
+                structure_radius * rng.random_range(0.5..1.2),
+                structure_radius * rng.random_range(0.5..1.2),
+                rng.random_range(0.0..std::f32::consts::TAU),
+            ));
         }
 
         Self {
             lobes,
-            field: CoarseField::new(
+            field: DensityField::new(
                 bounds.min_x,
                 bounds.max_x,
                 bounds.min_y,
@@ -616,10 +618,11 @@ impl DensityStructure {
             .iter()
             .map(|lobe| lobe.coverage(x, y))
             .fold(f32::NEG_INFINITY, f32::max);
-        let warped_shape = shape + self.field.sample(x, y) * self.outline_strength;
+        let field_value = self.field.sample(x, y);
+        let warped_shape = shape + field_value * self.outline_strength;
         let coverage = smoothstep(-self.feather, self.feather, warped_shape);
 
-        self.strength * coverage * (0.45 + 0.55 * normalized_field(&self.field, x, y))
+        self.strength * coverage * (0.45 + 0.55 * normalized_density_value(field_value))
     }
 }
 
@@ -657,16 +660,29 @@ struct Lobe {
     center_y: f32,
     radius_x: f32,
     radius_y: f32,
-    angle: f32,
+    sin_angle: f32,
+    cos_angle: f32,
 }
 
 impl Lobe {
+    fn new(center_x: f32, center_y: f32, radius_x: f32, radius_y: f32, angle: f32) -> Self {
+        let (sin_angle, cos_angle) = angle.sin_cos();
+
+        Self {
+            center_x,
+            center_y,
+            radius_x,
+            radius_y,
+            sin_angle,
+            cos_angle,
+        }
+    }
+
     fn coverage(&self, x: f32, y: f32) -> f32 {
         let dx = x - self.center_x;
         let dy = y - self.center_y;
-        let (sin, cos) = self.angle.sin_cos();
-        let local_x = dx * cos + dy * sin;
-        let local_y = -dx * sin + dy * cos;
+        let local_x = dx * self.cos_angle + dy * self.sin_angle;
+        let local_y = -dx * self.sin_angle + dy * self.cos_angle;
         let normalized_x = local_x / self.radius_x;
         let normalized_y = local_y / self.radius_y;
 
@@ -674,10 +690,9 @@ impl Lobe {
     }
 
     fn extents(&self) -> (f32, f32) {
-        let (sin, cos) = self.angle.sin_cos();
         (
-            (self.radius_x * cos).hypot(self.radius_y * sin),
-            (self.radius_x * sin).hypot(self.radius_y * cos),
+            (self.radius_x * self.cos_angle).hypot(self.radius_y * self.sin_angle),
+            (self.radius_x * self.sin_angle).hypot(self.radius_y * self.cos_angle),
         )
     }
 }
@@ -853,7 +868,7 @@ fn stain_luma(lightness: u8, shade_sample: u8) -> u8 {
         .clamp(0.0, 255.0) as u8
 }
 
-// A compact smooth field gives each stain a unique outline and uneven density.
+// A compact control lattice gives each stain an irregular outer outline.
 struct CoarseField {
     values: Vec<f32>,
     width: usize,
@@ -908,8 +923,78 @@ impl CoarseField {
     }
 }
 
-fn normalized_field(field: &CoarseField, x: f32, y: f32) -> f32 {
-    smoothstep(-1.0, 1.0, field.sample(x, y))
+// Density is evaluated at final-pixel coordinates with a cubic kernel so the
+// control lattice remains broad without exposing its rectangular cells.
+struct DensityField {
+    control: CoarseField,
+}
+
+impl DensityField {
+    fn new<R: Rng + ?Sized>(
+        min_x: f32,
+        max_x: f32,
+        min_y: f32,
+        max_y: f32,
+        cell_size: f32,
+        rng: &mut R,
+    ) -> Self {
+        Self {
+            control: CoarseField::new(min_x, max_x, min_y, max_y, cell_size, rng),
+        }
+    }
+
+    fn sample(&self, x: f32, y: f32) -> f32 {
+        let grid_x = ((x - self.control.origin_x) / self.control.cell_size)
+            .clamp(0.0, (self.control.width - 1) as f32);
+        let grid_y = ((y - self.control.origin_y) / self.control.cell_size)
+            .clamp(0.0, (self.control.height - 1) as f32);
+        let x0 = grid_x.floor() as isize;
+        let y0 = grid_y.floor() as isize;
+        let horizontal_weights = cubic_b_spline_weights(grid_x - x0 as f32);
+        let vertical_weights = cubic_b_spline_weights(grid_y - y0 as f32);
+        let mut value = 0.0;
+
+        for (row_offset, vertical_weight) in vertical_weights.iter().copied().enumerate() {
+            let row = y0 + row_offset as isize - 1;
+            let mut row_value = 0.0;
+            for (column_offset, horizontal_weight) in horizontal_weights.iter().copied().enumerate()
+            {
+                let column = x0 + column_offset as isize - 1;
+                row_value += self.control_value(column, row) * horizontal_weight;
+            }
+            value += row_value * vertical_weight;
+        }
+
+        value
+    }
+
+    fn control_value(&self, x: isize, y: isize) -> f32 {
+        let x = x.clamp(0, self.control.width as isize - 1) as usize;
+        let y = y.clamp(0, self.control.height as isize - 1) as usize;
+
+        self.control.value(x, y)
+    }
+}
+
+fn cubic_b_spline_weights(progress: f32) -> [f32; 4] {
+    let inverse = 1.0 - progress;
+    let squared = progress * progress;
+    let cubed = squared * progress;
+
+    [
+        inverse * inverse * inverse / 6.0,
+        (4.0 - 6.0 * squared + 3.0 * cubed) / 6.0,
+        (1.0 + 3.0 * progress + 3.0 * squared - 3.0 * cubed) / 6.0,
+        cubed / 6.0,
+    ]
+}
+
+fn normalized_density_field(field: &DensityField, x: f32, y: f32) -> f32 {
+    normalized_density_value(field.sample(x, y))
+}
+
+fn normalized_density_value(value: f32) -> f32 {
+    smoothstep(-1.0, 1.0, value)
 }
 
 fn soft_band(value: f32, center: f32, width: f32) -> f32 {
