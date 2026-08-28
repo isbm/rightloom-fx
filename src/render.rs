@@ -251,6 +251,17 @@ pub enum RenderError {
         source: io::Error,
     },
     OutputNotDirectory(PathBuf),
+    ReadOutput {
+        path: PathBuf,
+        source: io::Error,
+    },
+    CreateOutputFile {
+        path: PathBuf,
+        source: io::Error,
+    },
+    SequenceExhausted {
+        prefix: String,
+    },
     WriteImage {
         path: PathBuf,
         source: image::ImageError,
@@ -291,6 +302,23 @@ impl fmt::Display for RenderError {
                     path.display()
                 )
             }
+            Self::ReadOutput { path, source } => {
+                write!(
+                    formatter,
+                    "failed to read output directory '{}': {source}",
+                    path.display()
+                )
+            }
+            Self::CreateOutputFile { path, source } => {
+                write!(
+                    formatter,
+                    "failed to create output file '{}': {source}",
+                    path.display()
+                )
+            }
+            Self::SequenceExhausted { prefix } => {
+                write!(formatter, "output sequence for '{prefix}' is exhausted")
+            }
             Self::WriteImage { path, source } => {
                 write!(formatter, "failed to write '{}': {source}", path.display())
             }
@@ -302,6 +330,8 @@ impl Error for RenderError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::CreateOutput { source, .. } => Some(source),
+            Self::ReadOutput { source, .. } => Some(source),
+            Self::CreateOutputFile { source, .. } => Some(source),
             Self::WriteImage { source, .. } => Some(source),
             _ => None,
         }
@@ -311,24 +341,164 @@ impl Error for RenderError {
 pub(crate) fn write_images<F>(
     settings: &RenderSettings,
     prefix: &str,
-    mut render: F,
+    render: F,
 ) -> Result<(), RenderError>
 where
     F: FnMut() -> RgbaImage,
 {
+    write_images_with_progress(settings, prefix, render, |message| println!("{message}"))
+}
+
+fn write_images_with_progress<F, P>(
+    settings: &RenderSettings,
+    prefix: &str,
+    mut render: F,
+    mut progress: P,
+) -> Result<(), RenderError>
+where
+    F: FnMut() -> RgbaImage,
+    P: FnMut(&str),
+{
     settings.validate()?;
     prepare_output_directory(&settings.outdir)?;
 
-    for number in 1..=settings.amount {
+    let next_sequence = next_sequence_start(&settings.outdir, prefix)?;
+    let (first_sequence, first_path, first_file) =
+        reserve_next_output_file(&settings.outdir, prefix, next_sequence)?;
+    let first_filename = output_filename(prefix, first_sequence);
+    progress(&format!(
+        "starting {prefix}: {} image(s), {}x{}, output {}, sequence {first_sequence:04}",
+        settings.amount,
+        settings.resolution.width(),
+        settings.resolution.height(),
+        settings.outdir.display(),
+    ));
+
+    let mut reservation = Some((first_sequence, first_path, first_file));
+    let mut last_filename = first_filename.clone();
+
+    for index in 0..settings.amount {
+        let (sequence, path, file) = reservation
+            .take()
+            .expect("each image generation has a reserved output file");
+        let filename = output_filename(prefix, sequence);
+        progress(&format!("generating {filename} ..."));
+
         let mut image = render();
         settings.export_policy.apply_to(&mut image);
-        let path = settings.outdir.join(format!("{prefix}-{number:04}.png"));
-        image
-            .save_with_format(&path, ImageFormat::Png)
-            .map_err(|source| RenderError::WriteImage { path, source })?;
+        write_reserved_image(&path, file, &image)?;
+
+        progress(&format!("done {filename}"));
+        last_filename = filename;
+
+        if index + 1 < settings.amount {
+            let next_sequence = advance_sequence(sequence, prefix)?;
+            reservation = Some(reserve_next_output_file(
+                &settings.outdir,
+                prefix,
+                next_sequence,
+            )?);
+        }
     }
 
+    progress(&format!(
+        "completed {prefix}: {} image(s) in {}; files {first_filename} through {last_filename}",
+        settings.amount,
+        settings.outdir.display(),
+    ));
+
     Ok(())
+}
+
+fn next_sequence_start(directory: &Path, prefix: &str) -> Result<u64, RenderError> {
+    let entries = fs::read_dir(directory).map_err(|source| RenderError::ReadOutput {
+        path: directory.to_path_buf(),
+        source,
+    })?;
+    let mut highest = 0;
+
+    for entry in entries {
+        let entry = entry.map_err(|source| RenderError::ReadOutput {
+            path: directory.to_path_buf(),
+            source,
+        })?;
+        if !entry.path().is_file() {
+            continue;
+        }
+        let file_name = entry.file_name();
+        let Some(file_name) = file_name.to_str() else {
+            continue;
+        };
+        let Some(sequence) = parse_sequence_number(file_name, prefix) else {
+            continue;
+        };
+
+        highest = highest.max(sequence);
+    }
+
+    advance_sequence(highest, prefix)
+}
+
+fn parse_sequence_number(file_name: &str, prefix: &str) -> Option<u64> {
+    let digits = file_name
+        .strip_prefix(prefix)?
+        .strip_prefix('-')?
+        .strip_suffix(".png")?;
+
+    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+
+    digits.parse().ok()
+}
+
+fn reserve_next_output_file(
+    directory: &Path,
+    prefix: &str,
+    starting_sequence: u64,
+) -> Result<(u64, PathBuf, fs::File), RenderError> {
+    let mut sequence = starting_sequence;
+
+    loop {
+        let path = directory.join(output_filename(prefix, sequence));
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(file) => return Ok((sequence, path, file)),
+            Err(source) if source.kind() == io::ErrorKind::AlreadyExists => {
+                sequence = advance_sequence(sequence, prefix)?;
+            }
+            Err(source) => return Err(RenderError::CreateOutputFile { path, source }),
+        }
+    }
+}
+
+fn advance_sequence(sequence: u64, prefix: &str) -> Result<u64, RenderError> {
+    sequence
+        .checked_add(1)
+        .ok_or_else(|| RenderError::SequenceExhausted {
+            prefix: prefix.to_owned(),
+        })
+}
+
+fn output_filename(prefix: &str, sequence: u64) -> String {
+    format!("{prefix}-{sequence:04}.png")
+}
+
+fn write_reserved_image(
+    path: &Path,
+    mut file: fs::File,
+    image: &RgbaImage,
+) -> Result<(), RenderError> {
+    let result = image.write_to(&mut file, ImageFormat::Png);
+    drop(file);
+
+    result.map_err(|source| RenderError::WriteImage {
+        path: path.to_path_buf(),
+        source,
+    })
 }
 
 fn prepare_output_directory(path: &Path) -> Result<(), RenderError> {
