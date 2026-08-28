@@ -243,7 +243,7 @@ impl RenderSettings {
 pub enum RenderError {
     InvalidDensity(u8),
     InvalidBlur(u8),
-    InvalidStrength(u8),
+    InvalidLightness(u8),
     InvalidAmount,
     NoEffects,
     CreateOutput {
@@ -269,10 +269,10 @@ impl fmt::Display for RenderError {
             Self::InvalidBlur(blur) => {
                 write!(formatter, "blur must be between 0 and 100, got {blur}")
             }
-            Self::InvalidStrength(strength) => {
+            Self::InvalidLightness(lightness) => {
                 write!(
                     formatter,
-                    "strength must be between 0 and 100, got {strength}"
+                    "lightness must be between 0 and 100, got {lightness}"
                 )
             }
             Self::InvalidAmount => write!(formatter, "amount must be at least 1"),

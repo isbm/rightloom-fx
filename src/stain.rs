@@ -7,14 +7,20 @@ const MAX_SOFTNESS_FRACTION: f32 = 0.35;
 const TRANSITION_WIDTH_PER_SIGMA: f32 = 2.56;
 const MAX_WORKING_CELL_SIZE: f32 = 4.0;
 const BOX_BLUR_PASSES: usize = 3;
-const LIGHT_STAIN_LUMA: f32 = 230.0;
-const DARK_STAIN_LUMA: f32 = 20.0;
+const LIGHTNESS_ANCHORS: [(u8, f32); 6] = [
+    (0, 0.0),
+    (10, 25.0),
+    (25, 70.0),
+    (50, 140.0),
+    (75, 205.0),
+    (100, 255.0),
+];
 
 #[derive(Debug, Clone)]
 pub struct StainSettings {
     pub render: RenderSettings,
     pub blur: u8,
-    pub strength: u8,
+    pub lightness: u8,
 }
 
 impl StainSettings {
@@ -22,8 +28,8 @@ impl StainSettings {
         if self.blur > 100 {
             return Err(RenderError::InvalidBlur(self.blur));
         }
-        if self.strength > 100 {
-            return Err(RenderError::InvalidStrength(self.strength));
+        if self.lightness > 100 {
+            return Err(RenderError::InvalidLightness(self.lightness));
         }
 
         Ok(())
@@ -62,7 +68,7 @@ fn render_image<R: Rng + ?Sized>(settings: &StainSettings, rng: &mut R) -> RgbaI
             * (0.04 + 0.12 * density_scale.sqrt())
             * rng.random_range(0.78..1.18);
         let anchor = choose_anchor(width, height, base_radius, &anchors, density_scale, rng);
-        let stain = Stain::new(anchor, base_radius, density_scale, settings.strength, rng);
+        let stain = Stain::new(anchor, base_radius, density_scale, settings.lightness, rng);
         stain.rasterize(&mut image, settings.blur);
         anchors.push(anchor);
     }
@@ -163,7 +169,7 @@ impl Stain {
         anchor: (f32, f32),
         base_radius: f32,
         density_scale: f32,
-        strength: u8,
+        lightness: u8,
         rng: &mut R,
     ) -> Self {
         let lobe_count = rng.random_range(4..=7);
@@ -236,7 +242,7 @@ impl Stain {
         );
         let outline_strength = rng.random_range(0.11..0.2);
         let feather = rng.random_range(0.07..0.15);
-        let shade = stain_luma(strength, rng.random_range(155..=235));
+        let shade = stain_luma(lightness, rng.random_range(155..=235));
         let alpha = (5.0 + 108.0 * density_scale.powf(0.72)) * rng.random_range(0.72..1.12);
         let body_variation_field = CoarseField::new(
             min_x,
@@ -824,15 +830,27 @@ fn box_blur_radius(sigma_cells: f32) -> usize {
         .max(1.0) as usize
 }
 
-fn stain_luma(strength: u8, shade_sample: u8) -> u8 {
-    let base_luma = lerp(
-        LIGHT_STAIN_LUMA,
-        DARK_STAIN_LUMA,
-        f32::from(strength) / 100.0,
-    );
+fn lightness_luma(lightness: u8) -> f32 {
+    let lightness = f32::from(lightness);
+    let (start, end) = LIGHTNESS_ANCHORS
+        .windows(2)
+        .find(|segment| lightness <= f32::from(segment[1].0))
+        .map(|segment| (segment[0], segment[1]))
+        .unwrap_or((LIGHTNESS_ANCHORS[4], LIGHTNESS_ANCHORS[5]));
+
+    lerp(
+        start.1,
+        end.1,
+        (lightness - f32::from(start.0)) / f32::from(end.0 - start.0),
+    )
+}
+
+fn stain_luma(lightness: u8, shade_sample: u8) -> u8 {
     let luma_variation = (f32::from(shade_sample) - 195.0) * 0.1;
 
-    (base_luma + luma_variation).round().clamp(0.0, 255.0) as u8
+    (lightness_luma(lightness) + luma_variation)
+        .round()
+        .clamp(0.0, 255.0) as u8
 }
 
 // A compact smooth field gives each stain a unique outline and uneven density.

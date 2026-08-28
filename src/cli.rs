@@ -31,7 +31,7 @@ pub(crate) struct ScratchesArgs {
 pub(crate) struct StainArgs {
     pub(crate) render: RenderSettings,
     pub(crate) blur: u8,
-    pub(crate) strength: u8,
+    pub(crate) lightness: u8,
 }
 
 impl Cli {
@@ -67,9 +67,9 @@ impl Cli {
                 blur: *arguments
                     .get_one("blur")
                     .expect("clap supplies the stain blur default"),
-                strength: *arguments
-                    .get_one("strength")
-                    .expect("clap supplies the stain strength default"),
+                lightness: *arguments
+                    .get_one("lightness")
+                    .expect("clap supplies the stain lightness default"),
             }),
             _ => unreachable!("clap only exposes configured subcommands"),
         };
@@ -172,13 +172,13 @@ fn stain_command(styles: styling::Styles) -> ClapCommand {
                     .value_parser(parse_blur),
             )
             .arg(
-                Arg::new("strength")
-                    .short('s')
-                    .long("strength")
+                Arg::new("lightness")
+                    .short('l')
+                    .long("lightness")
                     .value_name("PERCENT")
-                    .help("Stain darkness, 0-100.\n0 = very light, 100 = very dark.")
-                    .default_value("50")
-                    .value_parser(parse_strength),
+                    .help("Stain brightness, 0-100.\n10 matches the current/default appearance.\n0 = nearly black, 100 = near-white.")
+                    .default_value("10")
+                    .value_parser(parse_lightness),
             ),
     )
 }
@@ -285,16 +285,16 @@ pub(crate) fn parse_blur(value: &str) -> Result<u8, String> {
     Ok(blur as u8)
 }
 
-pub(crate) fn parse_strength(value: &str) -> Result<u8, String> {
-    let strength = value
+pub(crate) fn parse_lightness(value: &str) -> Result<u8, String> {
+    let lightness = value
         .parse::<u16>()
-        .map_err(|_| "strength must be an integer between 0 and 100".to_owned())?;
+        .map_err(|_| "lightness must be an integer between 0 and 100".to_owned())?;
 
-    if strength > 100 {
-        return Err("strength must be between 0 and 100".to_owned());
+    if lightness > 100 {
+        return Err("lightness must be between 0 and 100".to_owned());
     }
 
-    Ok(strength as u8)
+    Ok(lightness as u8)
 }
 
 pub(crate) fn parse_background(value: &str) -> Result<RgbColor, String> {

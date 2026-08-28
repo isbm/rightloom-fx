@@ -24,7 +24,7 @@ fn run_cli(cli: Cli) -> Result<(), scratches::RenderError> {
         Command::Stain(args) => generate_stain_images(&StainSettings {
             render: args.render,
             blur: args.blur,
-            strength: args.strength,
+            lightness: args.lightness,
         }),
     }
 }
