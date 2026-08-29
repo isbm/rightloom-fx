@@ -138,3 +138,39 @@ fn stain_command_with_alpha_preserves_transparency() {
     assert!(image.pixels().any(|pixel| pixel[3] == 0));
     assert!(image.pixels().any(|pixel| pixel[3] > 0));
 }
+
+#[test]
+fn bokeh_command_writes_numbered_pngs_through_shared_output_handling() {
+    let output = TestOutputDir::new();
+    let output_argument = output.path().to_string_lossy().into_owned();
+
+    run_from([
+        "rightloom-fx",
+        "bokeh",
+        "-r",
+        "320x200",
+        "-t",
+        "twinkle",
+        "-t",
+        "edge",
+        "-d",
+        "50",
+        "-s",
+        "70",
+        "-u",
+        "25",
+        "-a",
+        "2",
+        "-o",
+        output_argument.as_str(),
+    ])
+    .expect("command should generate images");
+
+    for number in 1..=2 {
+        let path = output.path().join(format!("bokeh-{number:04}.png"));
+        assert!(path.is_file(), "{} should exist", path.display());
+        let image = image::open(&path).expect("output should be a readable PNG");
+        assert_eq!(image.dimensions(), (320, 200));
+        assert!(image.to_rgba8().pixels().all(|pixel| pixel[3] == 255));
+    }
+}

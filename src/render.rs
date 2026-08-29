@@ -245,8 +245,11 @@ pub enum RenderError {
     InvalidBlur(u8),
     InvalidLightness(u8),
     InvalidContrast(u8),
+    InvalidSize(u8),
+    InvalidUniform(u8),
     InvalidAmount,
     NoEffects,
+    NoBokehTypes,
     CreateOutput {
         path: PathBuf,
         source: io::Error,
@@ -293,8 +296,18 @@ impl fmt::Display for RenderError {
                     "contrast must be between 0 and 100, got {contrast}"
                 )
             }
+            Self::InvalidSize(size) => {
+                write!(formatter, "size must be between 0 and 100, got {size}")
+            }
+            Self::InvalidUniform(uniform) => {
+                write!(
+                    formatter,
+                    "uniform must be between 0 and 100, got {uniform}"
+                )
+            }
             Self::InvalidAmount => write!(formatter, "amount must be at least 1"),
             Self::NoEffects => write!(formatter, "at least one scratch type must be supplied"),
+            Self::NoBokehTypes => write!(formatter, "at least one bokeh type must be supplied"),
             Self::CreateOutput { path, source } => {
                 write!(
                     formatter,

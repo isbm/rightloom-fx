@@ -1,9 +1,11 @@
 use std::str::FromStr;
 
 use super::{
-    Cli, Command, cli, parse_amount, parse_background, parse_blur, parse_contrast, parse_density,
-    parse_lightness, parse_scratch_type,
+    Cli, Command, cli, parse_amount, parse_background, parse_blur, parse_bokeh_places,
+    parse_bokeh_type, parse_contrast, parse_density, parse_lightness, parse_scratch_type,
+    parse_size, parse_uniform,
 };
+use crate::bokeh::{BokehPlacement, BokehType};
 use crate::render::{ExportPolicy, RgbColor};
 use crate::scratches::{Resolution, ScratchType};
 
@@ -87,7 +89,9 @@ fn stain_cli_accepts_contrast_endpoints_and_default() {
 
         let parsed = match cli.command {
             Command::Stain(args) => args.contrast,
-            Command::Scratches(_) => panic!("stain command should parse as stain"),
+            Command::Scratches(_) | Command::Bokeh(_) => {
+                panic!("stain command should parse as stain")
+            }
         };
         assert_eq!(parsed, contrast);
     }
@@ -119,6 +123,159 @@ fn scratch_types_are_parsed_and_validated() {
     assert_eq!(parse_scratch_type("camera"), Ok(ScratchType::Camera));
     assert_eq!(parse_scratch_type("bend"), Ok(ScratchType::Bend));
     assert!(parse_scratch_type("unknown").is_err());
+}
+
+fn parse_bokeh(arguments: &[&str]) -> Result<Cli, clap::Error> {
+    let mut command = vec![
+        "rightloom-fx",
+        "bokeh",
+        "-r",
+        "320x200",
+        "-d",
+        "50",
+        "-a",
+        "1",
+        "-o",
+        "output",
+    ];
+    command.extend_from_slice(arguments);
+    Cli::try_parse_from(command)
+}
+
+#[test]
+fn bokeh_subcommand_and_each_type_parse() {
+    for (value, expected) in [
+        ("twinkle", BokehType::Twinkle),
+        ("edge", BokehType::Edge),
+        ("damage", BokehType::Damage),
+    ] {
+        let cli = parse_bokeh(&["-t", value]).expect("bokeh type should parse");
+        let args = match cli.command {
+            Command::Bokeh(args) => args,
+            Command::Scratches(_) | Command::Stain(_) => {
+                panic!("bokeh command should parse as bokeh")
+            }
+        };
+
+        assert_eq!(args.types, [expected]);
+        assert_eq!(args.size, 50);
+        assert_eq!(args.uniform, 50);
+    }
+}
+
+#[test]
+fn bokeh_cli_accepts_multiple_types() {
+    let cli = parse_bokeh(&["-t", "twinkle", "-t", "edge", "-t", "damage"])
+        .expect("multiple bokeh types should parse");
+    let types = match cli.command {
+        Command::Bokeh(args) => args.types,
+        Command::Scratches(_) | Command::Stain(_) => panic!("bokeh command should parse as bokeh"),
+    };
+
+    assert_eq!(
+        types,
+        [BokehType::Twinkle, BokehType::Edge, BokehType::Damage]
+    );
+}
+
+#[test]
+fn bokeh_cli_rejects_unknown_and_missing_types() {
+    assert!(parse_bokeh(&["-t", "unknown"]).is_err());
+    assert!(parse_bokeh(&[]).is_err());
+    assert!(parse_bokeh_type("unknown").is_err());
+}
+
+#[test]
+fn bokeh_placement_names_and_short_forms_parse_identically() {
+    for (name, short, expected) in [
+        ("center", "c", BokehPlacement::Center),
+        ("left", "l", BokehPlacement::Left),
+        ("right", "r", BokehPlacement::Right),
+        ("top", "t", BokehPlacement::Top),
+        ("bottom", "b", BokehPlacement::Bottom),
+    ] {
+        assert_eq!(parse_bokeh_places(name), Ok(vec![expected]));
+        assert_eq!(parse_bokeh_places(short), Ok(vec![expected]));
+    }
+}
+
+#[test]
+fn bokeh_cli_normalizes_comma_repeated_and_duplicate_placements() {
+    let cli = parse_bokeh(&[
+        "-t",
+        "twinkle",
+        "-p",
+        "c,l",
+        "--place",
+        "left,right",
+        "-p",
+        "center",
+    ])
+    .expect("placements should parse");
+    let placements = match cli.command {
+        Command::Bokeh(args) => args.placements,
+        Command::Scratches(_) | Command::Stain(_) => panic!("bokeh command should parse as bokeh"),
+    };
+
+    assert_eq!(
+        placements,
+        [
+            BokehPlacement::Center,
+            BokehPlacement::Left,
+            BokehPlacement::Right
+        ]
+    );
+}
+
+#[test]
+fn bokeh_cli_uses_an_empty_placement_list_for_unbiased_rendering() {
+    let cli = parse_bokeh(&["-t", "twinkle"]).expect("bokeh should parse without placement");
+    let placements = match cli.command {
+        Command::Bokeh(args) => args.placements,
+        Command::Scratches(_) | Command::Stain(_) => panic!("bokeh command should parse as bokeh"),
+    };
+
+    assert!(placements.is_empty());
+}
+
+#[test]
+fn bokeh_cli_rejects_unknown_placements() {
+    assert!(parse_bokeh(&["-t", "twinkle", "-p", "middle"]).is_err());
+    assert!(parse_bokeh_places("c,").is_err());
+}
+
+#[test]
+fn bokeh_size_and_uniform_are_limited_to_percentages() {
+    for value in ["0", "100"] {
+        let expected = value.parse::<u8>().expect("test value should parse");
+        assert_eq!(parse_size(value), Ok(expected));
+        assert_eq!(parse_uniform(value), Ok(expected));
+    }
+
+    assert!(parse_size("101").is_err());
+    assert!(parse_uniform("101").is_err());
+}
+
+#[test]
+fn bokeh_cli_reuses_shared_alpha_and_background_export_options() {
+    let alpha =
+        parse_bokeh(&["-t", "twinkle", "--alpha"]).expect("alpha bokeh command should parse");
+    let alpha_policy = match alpha.command {
+        Command::Bokeh(args) => args.render.export_policy,
+        Command::Scratches(_) | Command::Stain(_) => panic!("bokeh command should parse as bokeh"),
+    };
+    assert_eq!(alpha_policy, ExportPolicy::PreserveAlpha);
+
+    let background = parse_bokeh(&["-t", "twinkle", "--background=123456"])
+        .expect("background bokeh command should parse");
+    let background_policy = match background.command {
+        Command::Bokeh(args) => args.render.export_policy,
+        Command::Scratches(_) | Command::Stain(_) => panic!("bokeh command should parse as bokeh"),
+    };
+    assert_eq!(
+        background_policy,
+        ExportPolicy::Flatten(RgbColor::new(18, 52, 86))
+    );
 }
 
 #[test]
@@ -164,7 +321,7 @@ fn stain_cli_accepts_exact_resolution() {
             args.contrast,
             args.render.export_policy,
         ),
-        Command::Scratches(_) => panic!("stain command should parse as stain"),
+        Command::Scratches(_) | Command::Bokeh(_) => panic!("stain command should parse as stain"),
     };
 
     assert_eq!((resolution.width(), resolution.height()), (6240, 4160));
@@ -204,7 +361,7 @@ fn stain_cli_accepts_aspect_ratio_resolution() {
             args.contrast,
             args.render.export_policy,
         ),
-        Command::Scratches(_) => panic!("stain command should parse as stain"),
+        Command::Scratches(_) | Command::Bokeh(_) => panic!("stain command should parse as stain"),
     };
 
     assert_eq!((resolution.width(), resolution.height()), (4160, 6240));
@@ -236,7 +393,7 @@ fn stain_cli_alpha_selects_transparent_export() {
 
     let export_policy = match cli.command {
         Command::Stain(args) => args.render.export_policy,
-        Command::Scratches(_) => panic!("stain command should parse as stain"),
+        Command::Scratches(_) | Command::Bokeh(_) => panic!("stain command should parse as stain"),
     };
 
     assert_eq!(export_policy, ExportPolicy::PreserveAlpha);

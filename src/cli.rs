@@ -4,6 +4,7 @@ use clap::{Arg, ArgAction, ArgGroup, ArgMatches, Command as ClapCommand, builder
 use colored::Colorize;
 
 use crate::{
+    bokeh::{BokehPlacement, BokehType},
     render::{ExportPolicy, RenderSettings, Resolution, RgbColor},
     scratches::ScratchType,
 };
@@ -19,6 +20,7 @@ pub(crate) struct Cli {
 pub(crate) enum Command {
     Scratches(ScratchesArgs),
     Stain(StainArgs),
+    Bokeh(BokehArgs),
 }
 
 #[derive(Debug)]
@@ -33,6 +35,15 @@ pub(crate) struct StainArgs {
     pub(crate) blur: u8,
     pub(crate) lightness: u8,
     pub(crate) contrast: u8,
+}
+
+#[derive(Debug)]
+pub(crate) struct BokehArgs {
+    pub(crate) render: RenderSettings,
+    pub(crate) types: Vec<BokehType>,
+    pub(crate) placements: Vec<BokehPlacement>,
+    pub(crate) size: u8,
+    pub(crate) uniform: u8,
 }
 
 impl Cli {
@@ -75,11 +86,40 @@ impl Cli {
                     .get_one("contrast")
                     .expect("clap supplies the stain contrast default"),
             }),
+            "bokeh" => Command::Bokeh(BokehArgs {
+                render: render_settings(arguments),
+                types: arguments
+                    .get_many("type")
+                    .expect("clap requires at least one bokeh type")
+                    .copied()
+                    .collect(),
+                placements: bokeh_placements(arguments),
+                size: *arguments
+                    .get_one("size")
+                    .expect("clap supplies the bokeh size default"),
+                uniform: *arguments
+                    .get_one("uniform")
+                    .expect("clap supplies the bokeh uniform default"),
+            }),
             _ => unreachable!("clap only exposes configured subcommands"),
         };
 
         Self { command }
     }
+}
+
+fn bokeh_placements(arguments: &ArgMatches) -> Vec<BokehPlacement> {
+    let mut placements = Vec::new();
+
+    for value in arguments.get_many::<String>("place").into_iter().flatten() {
+        for placement in parse_bokeh_places(value).expect("clap validates bokeh placements") {
+            if !placements.contains(&placement) {
+                placements.push(placement);
+            }
+        }
+    }
+
+    placements
 }
 
 fn render_settings(arguments: &ArgMatches) -> RenderSettings {
@@ -128,6 +168,7 @@ pub(crate) fn cli() -> ClapCommand {
         .subcommand_required(true)
         .subcommand(scratches_command(styles.clone()))
         .subcommand(stain_command(styles.clone()))
+        .subcommand(bokeh_command(styles.clone()))
         .disable_colored_help(false)
         .styles(styles)
 }
@@ -193,6 +234,62 @@ fn stain_command(styles: styling::Styles) -> ClapCommand {
                     .default_value("50")
                     .value_parser(parse_contrast),
             ),
+    )
+}
+
+fn bokeh_command(styles: styling::Styles) -> ClapCommand {
+    let types = BokehType::names().join(", ");
+    shared_render_arguments(
+        ClapCommand::new("bokeh")
+            .about("Generate monochrome analog-film optical bokeh overlays")
+            .styles(styles)
+            .arg(
+                Arg::new("type")
+                    .short('t')
+                    .long("type")
+                    .value_name("TYPE")
+                    .help(format!(
+                        "Bokeh artifact type to combine; repeat for multiple types. Available types: {}",
+                        types.bright_green()
+                    ))
+                    .required(true)
+                    .action(ArgAction::Append)
+                    .value_parser(parse_bokeh_type),
+            )
+            .arg(
+                Arg::new("place")
+                    .short('p')
+                    .long("place")
+                    .value_name("PLACES")
+                    .help("Placement bias. Use center/c, left/l, right/r, top/t, or bottom/b; comma-separate or repeat.")
+                    .action(ArgAction::Append)
+                    .value_parser(validate_bokeh_places),
+            )
+            .arg(
+                Arg::new("size")
+                    .short('s')
+                    .long("size")
+                    .value_name("PERCENT")
+                    .help("Maximum artifact scale from 0 to 100.")
+                    .default_value("50")
+                    .value_parser(parse_size),
+            )
+            .arg(
+                Arg::new("uniform")
+                    .short('u')
+                    .long("uniform")
+                    .value_name("PERCENT")
+                    .help("Artifact size similarity from 0 to 100.")
+                    .default_value("50")
+                    .value_parser(parse_uniform),
+            )
+            .after_help(format!(
+                "{}\n  {}  large diffuse optical circles\n  {}      broad film-edge exposure strips\n  {}    irregular softened border damage",
+                "Supported bokeh types:".bright_yellow().bold(),
+                "twinkle".bright_green(),
+                "edge".bright_green(),
+                "damage".bright_green(),
+            )),
     )
 }
 
@@ -322,6 +419,26 @@ pub(crate) fn parse_contrast(value: &str) -> Result<u8, String> {
     Ok(contrast as u8)
 }
 
+pub(crate) fn parse_size(value: &str) -> Result<u8, String> {
+    parse_bokeh_percentage(value, "size")
+}
+
+pub(crate) fn parse_uniform(value: &str) -> Result<u8, String> {
+    parse_bokeh_percentage(value, "uniform")
+}
+
+fn parse_bokeh_percentage(value: &str, name: &str) -> Result<u8, String> {
+    let percentage = value
+        .parse::<u16>()
+        .map_err(|_| format!("{name} must be an integer between 0 and 100"))?;
+
+    if percentage > 100 {
+        return Err(format!("{name} must be between 0 and 100"));
+    }
+
+    Ok(percentage as u8)
+}
+
 pub(crate) fn parse_background(value: &str) -> Result<RgbColor, String> {
     let digits = value.strip_prefix('#').unwrap_or(value);
     if digits.len() != 6 || !digits.bytes().all(|byte| byte.is_ascii_hexdigit()) {
@@ -337,6 +454,18 @@ pub(crate) fn parse_background(value: &str) -> Result<RgbColor, String> {
 
 pub(crate) fn parse_scratch_type(value: &str) -> Result<ScratchType, String> {
     ScratchType::from_str(value)
+}
+
+pub(crate) fn parse_bokeh_type(value: &str) -> Result<BokehType, String> {
+    BokehType::from_str(value)
+}
+
+pub(crate) fn parse_bokeh_places(value: &str) -> Result<Vec<BokehPlacement>, String> {
+    BokehPlacement::parse_list(value)
+}
+
+fn validate_bokeh_places(value: &str) -> Result<String, String> {
+    parse_bokeh_places(value).map(|_| value.to_owned())
 }
 
 pub(crate) fn parse_amount(value: &str) -> Result<u32, String> {
