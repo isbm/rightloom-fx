@@ -244,6 +244,7 @@ pub enum RenderError {
     InvalidDensity(u8),
     InvalidBlur(u8),
     InvalidLightness(u8),
+    InvalidContrast(u8),
     InvalidAmount,
     NoEffects,
     CreateOutput {
@@ -284,6 +285,12 @@ impl fmt::Display for RenderError {
                 write!(
                     formatter,
                     "lightness must be between 0 and 100, got {lightness}"
+                )
+            }
+            Self::InvalidContrast(contrast) => {
+                write!(
+                    formatter,
+                    "contrast must be between 0 and 100, got {contrast}"
                 )
             }
             Self::InvalidAmount => write!(formatter, "amount must be at least 1"),

@@ -4,10 +4,13 @@ use rand::Rng;
 use crate::render::{RenderError, RenderSettings, blend_gray_pixel, write_images};
 
 const MAX_SOFTNESS_FRACTION: f32 = 0.35;
-const TRANSITION_WIDTH_PER_SIGMA: f32 = 2.56;
-const MAX_WORKING_CELL_SIZE: f32 = 4.0;
-const BOX_BLUR_PASSES: usize = 3;
-const DENSITY_EVALUATION_THRESHOLD: f32 = 0.0001;
+const MIN_SOFTNESS_NORMALIZED: f32 = 0.001;
+const MAX_WORKING_CELL_SIZE: f32 = 8.0;
+const COVERAGE_TAIL_THRESHOLD: f32 = 1e-4;
+const DEFAULT_CONTRAST: u8 = 50;
+// Existing local-density bounds also define the contrast normalization range.
+const MIN_INTERNAL_DENSITY: f32 = 0.20;
+const MAX_INTERNAL_DENSITY: f32 = 1.35;
 const TIDE_PRESENCE_ANCHORS: [(u8, f64); 6] = [
     (0, 0.0),
     (10, 0.05),
@@ -19,6 +22,7 @@ const TIDE_PRESENCE_ANCHORS: [(u8, f64); 6] = [
 const SECOND_TIDE_LINE_PROBABILITY: f64 = 0.0;
 const MAX_TIDE_RELATIVE_MODULATION: f32 = 0.10;
 const DENSITY_STRUCTURES_ENABLED: bool = true;
+const NORMAL_STAIN_TIDE_CONTRIBUTION_ENABLED: bool = false;
 const DENSITY_ALPHA_ANCHORS: [(u8, f32); 8] = [
     (0, 0.0),
     (5, 18.0),
@@ -44,6 +48,7 @@ pub struct StainSettings {
     pub render: RenderSettings,
     pub blur: u8,
     pub lightness: u8,
+    pub contrast: u8,
 }
 
 impl StainSettings {
@@ -53,6 +58,9 @@ impl StainSettings {
         }
         if self.lightness > 100 {
             return Err(RenderError::InvalidLightness(self.lightness));
+        }
+        if self.contrast > 100 {
+            return Err(RenderError::InvalidContrast(self.contrast));
         }
 
         Ok(())
@@ -103,6 +111,7 @@ fn render_image_with_structure_contribution<R: Rng + ?Sized>(
 
     let density = settings.render.density;
     let density_scale = density as f32 / 100.0;
+    let contrast_gain = contrast_gain(settings.contrast);
     let smallest_dimension = width.min(height) as f32;
     let mut anchors = Vec::new();
 
@@ -119,7 +128,8 @@ fn render_image_with_structure_contribution<R: Rng + ?Sized>(
             settings.lightness,
             structures_enabled,
             rng,
-        );
+        )
+        .with_contrast_gain(contrast_gain);
         stain.rasterize(&mut image, settings.blur);
         anchors.push(anchor);
     }
@@ -206,6 +216,7 @@ struct Stain {
     feather: f32,
     shade: u8,
     alpha: f32,
+    contrast_gain: f32,
 }
 
 #[derive(Clone, Copy)]
@@ -334,7 +345,13 @@ impl Stain {
             feather,
             shade,
             alpha,
+            contrast_gain: 1.0,
         }
+    }
+
+    fn with_contrast_gain(mut self, contrast_gain: f32) -> Self {
+        self.contrast_gain = contrast_gain;
+        self
     }
 
     fn rasterize(&self, image: &mut RgbaImage, blur: u8) {
@@ -373,14 +390,14 @@ impl Stain {
     }
 
     fn rasterize_diffused(&self, image: &mut RgbaImage, blur: u8) {
-        let mask = self.diffused_outer_mask(blur);
+        let coverage_field = self.diffused_outer_coverage(blur);
 
         let Some((start_x, end_x, start_y, end_y)) = self.image_bounds(
             image,
-            mask.min_x(),
-            mask.max_x(),
-            mask.min_y(),
-            mask.max_y(),
+            coverage_field.min_x(),
+            coverage_field.max_x(),
+            coverage_field.min_y(),
+            coverage_field.max_y(),
         ) else {
             return;
         };
@@ -389,8 +406,8 @@ impl Stain {
             for x in start_x..=end_x {
                 let world_x = x as f32 + 0.5;
                 let world_y = y as f32 + 0.5;
-                let coverage = mask.sample(world_x, world_y).clamp(0.0, 1.0);
-                if coverage <= DENSITY_EVALUATION_THRESHOLD {
+                let coverage = coverage_field.sample(world_x, world_y).clamp(0.0, 1.0);
+                if coverage <= COVERAGE_TAIL_THRESHOLD {
                     continue;
                 }
 
@@ -409,23 +426,12 @@ impl Stain {
         }
     }
 
-    fn diffused_outer_mask(&self, blur: u8) -> ScalarField {
-        let blur_fraction = f32::from(blur) / 100.0;
-        let transition_width = self.characteristic_size * blur_fraction * MAX_SOFTNESS_FRACTION;
-        let cell_size = (transition_width / 4.0).clamp(1.0, MAX_WORKING_CELL_SIZE);
-        let sigma_cells = transition_width / TRANSITION_WIDTH_PER_SIGMA / cell_size;
-        let blur_radius = box_blur_radius(sigma_cells);
-        let mut mask = self.outer_mask(cell_size, blur_radius);
-
-        // Three separable box passes give a broad Gaussian-like diffusion in linear time.
-        mask.blur_three_boxes(blur_radius);
-
-        mask
-    }
-
-    fn outer_mask(&self, cell_size: f32, blur_radius: usize) -> ScalarField {
-        let padding = (blur_radius * BOX_BLUR_PASSES) as f32 * cell_size + cell_size * 2.0;
-        let mut mask = ScalarField::new(
+    fn diffused_outer_coverage(&self, blur: u8) -> ScalarField {
+        let softness = softness_normalized(blur);
+        let softness_pixels = self.characteristic_size * softness;
+        let cell_size = (self.characteristic_size / 256.0).clamp(1.0, MAX_WORKING_CELL_SIZE);
+        let padding = softness_pixels * 3.0 + cell_size * 2.0;
+        let mut coverage_field = ScalarField::new(
             self.min_x - padding,
             self.max_x + padding,
             self.min_y - padding,
@@ -433,15 +439,28 @@ impl Stain {
             cell_size,
         );
 
-        for y in 0..mask.height {
-            for x in 0..mask.width {
-                let (world_x, world_y) = mask.position(x, y);
-                let warped_shape = self.warped_shape_at(world_x, world_y);
-                mask.set(x, y, smoothstep(-self.feather, self.feather, warped_shape));
+        for y in 0..coverage_field.height {
+            for x in 0..coverage_field.width {
+                let (world_x, world_y) = coverage_field.position(x, y);
+                let coverage = self.soft_outer_coverage_at(world_x, world_y, softness);
+                coverage_field.set(
+                    x,
+                    y,
+                    if coverage < COVERAGE_TAIL_THRESHOLD {
+                        0.0
+                    } else {
+                        coverage
+                    },
+                );
             }
         }
 
-        mask
+        coverage_field.blur_once(finishing_blur_radius_cells(softness_pixels, cell_size));
+        coverage_field
+    }
+
+    fn soft_outer_coverage_at(&self, x: f32, y: f32, softness: f32) -> f32 {
+        soft_outer_coverage(self.warped_shape_at(x, y), softness)
     }
 
     fn image_bounds(
@@ -477,14 +496,32 @@ impl Stain {
     }
 
     fn optical_density_at(&self, warped_shape: f32, x: f32, y: f32) -> f32 {
-        let local_density = self.local_density_at(x, y);
-        let tide_density = self.tide_contribution_at(warped_shape, x, y, local_density);
-        let directional_density = self
-            .directional
-            .as_ref()
-            .map_or(1.0, |directional| directional.multiplier_at(x, y));
+        contrast_adjusted_density(
+            self.unadjusted_optical_density_at(warped_shape, x, y),
+            self.contrast_gain,
+        )
+    }
 
-        (local_density + tide_density) * directional_density
+    fn unadjusted_optical_density_at(&self, warped_shape: f32, x: f32, y: f32) -> f32 {
+        self.chemical_density_at(warped_shape, x, y) * self.directional_density_at(x, y)
+    }
+
+    fn chemical_density_at(&self, warped_shape: f32, x: f32, y: f32) -> f32 {
+        let local_density = self.local_density_at(x, y);
+        // Keep TideMark construction for seeded output stability, but omit its contour band normally.
+        let tide_density = if NORMAL_STAIN_TIDE_CONTRIBUTION_ENABLED {
+            self.tide_contribution_at(warped_shape, x, y, local_density)
+        } else {
+            0.0
+        };
+
+        local_density + tide_density
+    }
+
+    fn directional_density_at(&self, x: f32, y: f32) -> f32 {
+        self.directional
+            .as_ref()
+            .map_or(1.0, |directional| directional.multiplier_at(x, y))
     }
 
     fn local_density_at(&self, x: f32, y: f32) -> f32 {
@@ -502,7 +539,8 @@ impl Stain {
         } else {
             0.0
         };
-        (broad_density * secondary_density + structure_density).clamp(0.20, 1.35)
+        (broad_density * secondary_density + structure_density)
+            .clamp(MIN_INTERNAL_DENSITY, MAX_INTERNAL_DENSITY)
     }
 
     fn tide_contribution_at(&self, warped_shape: f32, x: f32, y: f32, local_density: f32) -> f32 {
@@ -616,14 +654,8 @@ impl DensityStructure {
         density_scale: f32,
         rng: &mut R,
     ) -> Vec<Self> {
-        let mut count = if rng.random_bool(0.22) {
-            0
-        } else if rng.random_bool(0.3 + 0.35 * f64::from(density_scale)) {
-            2
-        } else {
-            1
-        };
-        if density_scale > 0.65 && rng.random_bool(0.3) {
+        let mut count = if rng.random_bool(0.30) { 0 } else { 1 };
+        if count == 1 && density_scale >= 0.70 && rng.random_bool(0.20) {
             count += 1;
         }
 
@@ -678,13 +710,9 @@ impl DensityStructure {
                 (structure_radius * rng.random_range(0.45..0.78)).max(12.0),
                 rng,
             ),
-            outline_strength: rng.random_range(0.08..0.18),
-            feather: rng.random_range(0.13..0.27),
-            strength: if rng.random_bool(0.48) {
-                rng.random_range(0.08..0.24)
-            } else {
-                -rng.random_range(0.12..0.36)
-            },
+            outline_strength: rng.random_range(0.02..0.07),
+            feather: rng.random_range(0.28..0.55),
+            strength: rng.random_range(0.03..0.14),
         }
     }
 
@@ -849,11 +877,9 @@ impl ScalarField {
         lerp(top, bottom, vertical)
     }
 
-    fn blur_three_boxes(&mut self, radius: usize) {
-        for _ in 0..BOX_BLUR_PASSES {
-            self.blur_horizontally(radius);
-            self.blur_vertically(radius);
-        }
+    fn blur_once(&mut self, radius: usize) {
+        self.blur_horizontally(radius);
+        self.blur_vertically(radius);
     }
 
     fn blur_horizontally(&mut self, radius: usize) {
@@ -912,13 +938,6 @@ impl ScalarField {
 
         self.values[y as usize * self.width + x as usize]
     }
-}
-
-fn box_blur_radius(sigma_cells: f32) -> usize {
-    let target_variance = sigma_cells * sigma_cells;
-    (((1.0 + 4.0 * target_variance).sqrt() - 1.0) * 0.5)
-        .ceil()
-        .max(1.0) as usize
 }
 
 fn density_base_alpha(density: u8) -> f32 {
@@ -1098,6 +1117,42 @@ fn normalized_density_field(field: &DensityField, x: f32, y: f32) -> f32 {
 
 fn normalized_density_value(value: f32) -> f32 {
     smoothstep(-1.0, 1.0, value)
+}
+
+fn softness_normalized(blur: u8) -> f32 {
+    debug_assert!(blur > 0);
+
+    (f32::from(blur) / 100.0 * MAX_SOFTNESS_FRACTION).max(MIN_SOFTNESS_NORMALIZED)
+}
+
+fn finishing_blur_radius_cells(softness_pixels: f32, cell_size: f32) -> usize {
+    (softness_pixels / cell_size * 0.10).round().clamp(1.0, 6.0) as usize
+}
+
+fn soft_outer_coverage(warped_shape: f32, softness: f32) -> f32 {
+    if warped_shape >= 0.0 {
+        return 1.0;
+    }
+
+    let distance = -warped_shape / softness;
+    (-(distance * distance)).exp()
+}
+
+fn contrast_gain(contrast: u8) -> f32 {
+    2.0_f32.powf((f32::from(contrast) - f32::from(DEFAULT_CONTRAST)) / 50.0)
+}
+
+fn contrast_adjusted_density(optical_density: f32, gain: f32) -> f32 {
+    if gain == 1.0 {
+        return optical_density;
+    }
+
+    let normalized_density = ((optical_density - MIN_INTERNAL_DENSITY)
+        / (MAX_INTERNAL_DENSITY - MIN_INTERNAL_DENSITY))
+        .clamp(0.0, 1.0);
+    let adjusted = 0.5 + (normalized_density - 0.5) * gain;
+
+    MIN_INTERNAL_DENSITY + adjusted.clamp(0.0, 1.0) * (MAX_INTERNAL_DENSITY - MIN_INTERNAL_DENSITY)
 }
 
 fn soft_band(value: f32, center: f32, width: f32) -> f32 {

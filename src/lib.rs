@@ -25,6 +25,7 @@ fn run_cli(cli: Cli) -> Result<(), scratches::RenderError> {
             render: args.render,
             blur: args.blur,
             lightness: args.lightness,
+            contrast: args.contrast,
         }),
     }
 }

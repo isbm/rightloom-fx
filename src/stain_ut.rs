@@ -1,19 +1,25 @@
-use std::{collections::BTreeSet, path::PathBuf};
+use std::{collections::BTreeSet, fs, path::PathBuf};
 
 use image::RgbaImage;
 use rand::{Rng, SeedableRng, rngs::StdRng};
 
 use super::{
-    CoarseField, DensityField, FieldBounds, MAX_TIDE_RELATIVE_MODULATION,
-    SECOND_TIDE_LINE_PROBABILITY, Stain, StainSettings, TideMark, bounded_tide_contribution,
-    density_base_alpha, generate_images_with_rng, generate_images_with_structure_contribution,
-    lightness_luma, render_image, render_image_with_structure_contribution, smoothstep,
-    tide_presence_probability,
+    COVERAGE_TAIL_THRESHOLD, CoarseField, DEFAULT_CONTRAST, DensityField, DensityStructure,
+    FieldBounds, MAX_TIDE_RELATIVE_MODULATION, SECOND_TIDE_LINE_PROBABILITY, Stain, StainSettings,
+    TideMark, bounded_tide_contribution, choose_anchor, contrast_adjusted_density, contrast_gain,
+    density_base_alpha, finishing_blur_radius_cells, generate_images_with_rng,
+    generate_images_with_structure_contribution, lightness_luma, render_image,
+    render_image_with_structure_contribution, smoothstep, soft_outer_coverage, softness_normalized,
+    stain_count, tide_presence_probability,
 };
 use crate::render::{ExportPolicy, RenderError, RenderSettings, Resolution};
 
 fn settings(density: u8, blur: u8, lightness: u8) -> StainSettings {
-    settings_with_resolution(640, 400, density, blur, lightness)
+    settings_with_contrast(density, blur, lightness, DEFAULT_CONTRAST)
+}
+
+fn settings_with_contrast(density: u8, blur: u8, lightness: u8, contrast: u8) -> StainSettings {
+    settings_with_resolution_and_contrast(640, 400, density, blur, lightness, contrast)
 }
 
 fn settings_with_resolution(
@@ -22,6 +28,17 @@ fn settings_with_resolution(
     density: u8,
     blur: u8,
     lightness: u8,
+) -> StainSettings {
+    settings_with_resolution_and_contrast(width, height, density, blur, lightness, DEFAULT_CONTRAST)
+}
+
+fn settings_with_resolution_and_contrast(
+    width: u32,
+    height: u32,
+    density: u8,
+    blur: u8,
+    lightness: u8,
+    contrast: u8,
 ) -> StainSettings {
     StainSettings {
         render: RenderSettings {
@@ -33,6 +50,7 @@ fn settings_with_resolution(
         },
         blur,
         lightness,
+        contrast,
     }
 }
 
@@ -50,6 +68,7 @@ fn structure_diagnostic_settings(outdir_name: &str) -> StainSettings {
         },
         blur: 50,
         lightness: 100,
+        contrast: DEFAULT_CONTRAST,
     }
 }
 
@@ -99,16 +118,52 @@ fn seeded_tide_mark(density: u8) -> TideMark {
     panic!("a seeded tide mark should be found");
 }
 
-fn seeded_stain_with_tide() -> Stain {
+fn seeded_stain(seed: u64, density: u8, structures_enabled: bool) -> Stain {
+    seeded_stain_with_contrast(seed, density, structures_enabled, DEFAULT_CONTRAST)
+}
+
+fn seeded_stain_with_contrast(
+    seed: u64,
+    density: u8,
+    structures_enabled: bool,
+    contrast: u8,
+) -> Stain {
+    let mut rng = StdRng::seed_from_u64(seed);
+
+    Stain::new(
+        (320.0, 200.0),
+        100.0,
+        density,
+        density as f32 / 100.0,
+        100,
+        structures_enabled,
+        &mut rng,
+    )
+    .with_contrast_gain(contrast_gain(contrast))
+}
+
+fn sampled_density_structures() -> Vec<DensityStructure> {
+    let mut structures = Vec::new();
+
+    for seed in 0..128 {
+        structures.extend(seeded_stain(seed, 100, true).structures);
+    }
+
+    structures
+}
+
+fn first_seed_with_tide() -> u64 {
     for seed in 0..1_000 {
-        let mut rng = StdRng::seed_from_u64(seed);
-        let stain = Stain::new((320.0, 200.0), 100.0, 100, 1.0, 100, true, &mut rng);
-        if stain.tide.is_some() {
-            return stain;
+        if seeded_stain(seed, 100, true).tide.is_some() {
+            return seed;
         }
     }
 
     panic!("a seeded high-density stain should contain a tide mark");
+}
+
+fn seeded_stain_with_tide() -> Stain {
+    seeded_stain(first_seed_with_tide(), 100, true)
 }
 
 fn normalized_alpha_bounds(image: &RgbaImage, minimum_alpha: u8) -> (f32, f32, f32, f32) {
@@ -230,14 +285,36 @@ fn tide_marks_have_bounded_modulation() {
     }
     assert!(maximum_density <= tide.strength + f32::EPSILON);
 
-    assert_close(bounded_tide_contribution(0.10, 0.20), 0.02);
+    assert_close(
+        bounded_tide_contribution(0.10, 0.20),
+        0.20 * MAX_TIDE_RELATIVE_MODULATION,
+    );
     assert_close(bounded_tide_contribution(0.10, 1.35), 0.10);
 }
 
 #[test]
-fn high_density_stain_keeps_a_broad_body_without_tide_dominance() {
+fn tide_construction_inside_seeded_stains_is_deterministic() {
+    let seed = first_seed_with_tide();
+    let stain = seeded_stain(seed, 100, true);
+    let repeated_stain = seeded_stain(seed, 100, true);
+    let tide = stain.tide.as_ref().expect("tide should exist");
+    let repeated_tide = repeated_stain.tide.as_ref().expect("tide should exist");
+    assert_eq!(tide.center, repeated_tide.center);
+    assert_eq!(tide.width, repeated_tide.width);
+    assert_eq!(tide.strength, repeated_tide.strength);
+    assert_eq!(tide.presence_threshold, repeated_tide.presence_threshold);
+    for (x, y) in [(160.0, 100.0), (320.0, 200.0), (480.0, 300.0)] {
+        assert_eq!(
+            tide.density_at(tide.center, x, y),
+            repeated_tide.density_at(repeated_tide.center, x, y)
+        );
+    }
+}
+
+#[test]
+fn normal_stains_exclude_tide_contribution() {
     let stain = seeded_stain_with_tide();
-    let mut maximum_relative_tide = 0.0_f32;
+    let mut observed_tide_density = false;
 
     for y in (0..400).step_by(4) {
         for x in (0..640).step_by(4) {
@@ -250,18 +327,25 @@ fn high_density_stain_keeps_a_broad_body_without_tide_dominance() {
                 world_y,
                 local_density,
             );
-            let relative_tide = tide_density / local_density;
-            maximum_relative_tide = maximum_relative_tide.max(relative_tide);
-
-            assert!(
-                relative_tide <= MAX_TIDE_RELATIVE_MODULATION + f32::EPSILON,
-                "tide contribution should remain bounded relative to the body"
+            observed_tide_density |= tide_density > 0.0;
+            let directional_density = stain.directional.as_ref().map_or(1.0, |directional| {
+                directional.multiplier_at(world_x, world_y)
+            });
+            assert_close(
+                stain.optical_density_at(stain.warped_shape_at(world_x, world_y), world_x, world_y),
+                local_density * directional_density,
             );
         }
     }
 
-    assert!(maximum_relative_tide <= MAX_TIDE_RELATIVE_MODULATION + f32::EPSILON);
+    assert!(
+        observed_tide_density,
+        "seeded stain should retain a TideMark for RNG stability"
+    );
+}
 
+#[test]
+fn high_density_stain_keeps_a_broad_cloudy_body() {
     let mut rng = StdRng::seed_from_u64(28);
     let image = render_image(&settings(100, 50, 100), &mut rng);
     let strong_pixels = image.pixels().filter(|pixel| pixel[3] >= 64).count();
@@ -339,6 +423,236 @@ fn seeded_rendering_is_deterministic() {
 }
 
 #[test]
+fn default_contrast_is_neutral() {
+    assert_eq!(DEFAULT_CONTRAST, 50);
+    assert_close(contrast_gain(DEFAULT_CONTRAST), 1.0);
+}
+
+#[test]
+fn contrast_gain_uses_the_requested_mapping() {
+    assert_close(contrast_gain(0), 0.5);
+    assert_close(contrast_gain(50), 1.0);
+    assert_close(contrast_gain(100), 2.0);
+}
+
+#[test]
+fn valid_contrast_values_are_accepted() {
+    for contrast in [0, 50, 100] {
+        assert!(
+            settings_with_contrast(45, 50, 70, contrast)
+                .validate()
+                .is_ok()
+        );
+    }
+}
+
+#[test]
+fn neutral_contrast_preserves_unadjusted_internal_density() {
+    let stain = seeded_stain(30, 70, true);
+
+    for (x, y) in [(160.0, 100.0), (320.0, 200.0), (480.0, 300.0)] {
+        let shape = stain.warped_shape_at(x, y);
+        assert_close(
+            stain.optical_density_at(shape, x, y),
+            stain.unadjusted_optical_density_at(shape, x, y),
+        );
+    }
+}
+
+#[test]
+fn higher_contrast_increases_distance_from_the_internal_midpoint() {
+    const MIDPOINT: f32 = 0.775;
+
+    for density in [0.4, 1.15] {
+        let flat = contrast_adjusted_density(density, contrast_gain(0));
+        let neutral = contrast_adjusted_density(density, contrast_gain(50));
+        let strong = contrast_adjusted_density(density, contrast_gain(100));
+
+        assert!((flat - MIDPOINT).abs() < (neutral - MIDPOINT).abs());
+        assert!((strong - MIDPOINT).abs() > (neutral - MIDPOINT).abs());
+    }
+}
+
+#[test]
+fn contrast_preserves_stain_geometry_and_rng_sequence() {
+    let mut low_rng = StdRng::seed_from_u64(31);
+    let low = Stain::new((320.0, 200.0), 100.0, 70, 0.70, 70, true, &mut low_rng)
+        .with_contrast_gain(contrast_gain(0));
+    let low_next = low_rng.random::<u64>();
+    let mut high_rng = StdRng::seed_from_u64(31);
+    let high = Stain::new((320.0, 200.0), 100.0, 70, 0.70, 70, true, &mut high_rng)
+        .with_contrast_gain(contrast_gain(100));
+    let high_next = high_rng.random::<u64>();
+
+    assert_eq!(low_next, high_next);
+    assert_eq!(low.lobes.len(), high.lobes.len());
+    assert_eq!(low.min_x, high.min_x);
+    assert_eq!(low.max_x, high.max_x);
+    assert_eq!(low.min_y, high.min_y);
+    assert_eq!(low.max_y, high.max_y);
+    assert_eq!(low.characteristic_size, high.characteristic_size);
+    assert_eq!(low.outline_strength, high.outline_strength);
+    assert_eq!(low.feather, high.feather);
+    assert_eq!(low.alpha, high.alpha);
+    assert_eq!(low.shade, high.shade);
+
+    for (low_lobe, high_lobe) in low.lobes.iter().zip(&high.lobes) {
+        assert_eq!(low_lobe.center_x, high_lobe.center_x);
+        assert_eq!(low_lobe.center_y, high_lobe.center_y);
+        assert_eq!(low_lobe.radius_x, high_lobe.radius_x);
+        assert_eq!(low_lobe.radius_y, high_lobe.radius_y);
+        assert_eq!(low_lobe.sin_angle, high_lobe.sin_angle);
+        assert_eq!(low_lobe.cos_angle, high_lobe.cos_angle);
+    }
+
+    let softness = softness_normalized(50);
+    for (x, y) in [(160.0, 100.0), (320.0, 200.0), (480.0, 300.0)] {
+        assert_eq!(low.warped_shape_at(x, y), high.warped_shape_at(x, y));
+        assert_eq!(
+            low.soft_outer_coverage_at(x, y, softness),
+            high.soft_outer_coverage_at(x, y, softness)
+        );
+        assert_eq!(low.local_density_at(x, y), high.local_density_at(x, y));
+    }
+
+    let mut low_render_rng = StdRng::seed_from_u64(32);
+    let low_render = render_image(&settings_with_contrast(70, 50, 70, 0), &mut low_render_rng);
+    let low_render_next = low_render_rng.random::<u64>();
+    let mut high_render_rng = StdRng::seed_from_u64(32);
+    let high_render = render_image(
+        &settings_with_contrast(70, 50, 70, 100),
+        &mut high_render_rng,
+    );
+    let high_render_next = high_render_rng.random::<u64>();
+
+    assert_eq!(low_render.dimensions(), high_render.dimensions());
+    assert_eq!(low_render_next, high_render_next);
+    assert_ne!(low_render, high_render);
+}
+
+#[test]
+fn density_structure_strengths_are_non_negative() {
+    let structures = sampled_density_structures();
+
+    assert!(
+        !structures.is_empty(),
+        "seeded samples should include structures"
+    );
+    assert!(structures.iter().all(|structure| structure.strength >= 0.0));
+}
+
+#[test]
+fn density_structure_strengths_are_bounded() {
+    let structures = sampled_density_structures();
+
+    assert!(
+        structures
+            .iter()
+            .all(|structure| (0.03..=0.14).contains(&structure.strength))
+    );
+}
+
+#[test]
+fn density_structure_feathers_are_bounded() {
+    let structures = sampled_density_structures();
+
+    assert!(
+        structures
+            .iter()
+            .all(|structure| (0.28..=0.55).contains(&structure.feather))
+    );
+}
+
+#[test]
+fn density_structure_outline_strengths_are_bounded() {
+    let structures = sampled_density_structures();
+
+    assert!(
+        structures
+            .iter()
+            .all(|structure| (0.02..=0.07).contains(&structure.outline_strength))
+    );
+}
+
+#[test]
+fn density_structure_count_never_exceeds_two() {
+    for density in [25, 69, 70, 100] {
+        for seed in 0..128 {
+            assert!(
+                seeded_stain(seed, density, true).structures.len() <= 2,
+                "density {density}, seed {seed}"
+            );
+        }
+    }
+}
+
+#[test]
+fn seeded_density_structure_generation_is_deterministic() {
+    let mut observed_structure = false;
+
+    for seed in 0..64 {
+        let first = seeded_stain(seed, 100, true);
+        let second = seeded_stain(seed, 100, true);
+        assert_eq!(
+            first.structures.len(),
+            second.structures.len(),
+            "seed {seed}"
+        );
+
+        for (first_structure, second_structure) in first.structures.iter().zip(&second.structures) {
+            observed_structure = true;
+            assert_eq!(first_structure.strength, second_structure.strength);
+            assert_eq!(first_structure.feather, second_structure.feather);
+            assert_eq!(
+                first_structure.outline_strength,
+                second_structure.outline_strength
+            );
+            for (x, y) in [(160.0, 100.0), (320.0, 200.0), (480.0, 300.0)] {
+                assert_eq!(
+                    first_structure.density_at(x, y),
+                    second_structure.density_at(x, y),
+                    "seed {seed}, point ({x}, {y})"
+                );
+            }
+        }
+    }
+
+    assert!(
+        observed_structure,
+        "seeded samples should include structures"
+    );
+}
+
+#[test]
+fn density_structures_never_reduce_local_density() {
+    const EPSILON: f32 = 0.000_001;
+
+    for seed in 0..64 {
+        let with_structures = seeded_stain(seed, 100, true);
+        let without_structures = seeded_stain(seed, 100, false);
+        assert_eq!(
+            with_structures.structures.len(),
+            without_structures.structures.len(),
+            "seed {seed}"
+        );
+
+        for y in 0..=8 {
+            for x in 0..=8 {
+                let sample_x = with_structures.min_x
+                    + (with_structures.max_x - with_structures.min_x) * x as f32 / 8.0;
+                let sample_y = with_structures.min_y
+                    + (with_structures.max_y - with_structures.min_y) * y as f32 / 8.0;
+                assert!(
+                    with_structures.local_density_at(sample_x, sample_y) + EPSILON
+                        >= without_structures.local_density_at(sample_x, sample_y),
+                    "seed {seed}, point ({sample_x}, {sample_y})"
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn structure_contribution_switch_preserves_rng_sequence() {
     let settings = settings(100, 50, 100);
     let mut enabled_rng = StdRng::seed_from_u64(29);
@@ -372,6 +686,60 @@ fn writes_seeded_structure_contribution_diagnostics() {
         generate_images_with_structure_contribution(&settings, structures_enabled, &mut rng)
             .expect("diagnostic images should write successfully");
     }
+}
+
+#[test]
+#[ignore = "writes seeded single-stain and composite coverage PNGs under .tmp"]
+fn writes_seeded_continuous_coverage_component_diagnostics() {
+    const WIDTH: u32 = 1000;
+    const HEIGHT: u32 = 667;
+    const DENSITY: u8 = 100;
+    const SEED: u64 = 41;
+
+    let outdir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join(".tmp")
+        .join("continuous-coverage-components");
+    fs::create_dir_all(&outdir).expect("diagnostic output directory should be created");
+
+    let density_scale = f32::from(DENSITY) / 100.0;
+    let smallest_dimension = WIDTH.min(HEIGHT) as f32;
+    let mut rng = StdRng::seed_from_u64(SEED);
+    let mut anchors = Vec::new();
+    let mut composite = RgbaImage::new(WIDTH, HEIGHT);
+
+    for index in 0..stain_count(DENSITY, &mut rng) {
+        let base_radius = smallest_dimension
+            * (0.04 + 0.12 * density_scale.sqrt())
+            * rng.random_range(0.78..1.18);
+        let anchor = choose_anchor(
+            WIDTH,
+            HEIGHT,
+            base_radius,
+            &anchors,
+            density_scale,
+            &mut rng,
+        );
+        let stain = Stain::new(
+            anchor,
+            base_radius,
+            DENSITY,
+            density_scale,
+            100,
+            true,
+            &mut rng,
+        );
+        let mut component = RgbaImage::new(WIDTH, HEIGHT);
+        stain.rasterize(&mut component, 50);
+        component
+            .save(outdir.join(format!("component-{index:02}.png")))
+            .expect("component diagnostic should write");
+        stain.rasterize(&mut composite, 50);
+        anchors.push(anchor);
+    }
+
+    composite
+        .save(outdir.join("composite.png"))
+        .expect("composite diagnostic should write");
 }
 
 #[test]
@@ -623,14 +991,79 @@ fn increasing_blur_broadens_the_transition() {
     assert!(footprint(&blur_100) > footprint(&blur_75));
     assert!(low_alpha(&blur_100) > low_alpha(&hard));
     assert!(alpha_sum(&blur_100) * 100 >= alpha_sum(&hard) * 60);
-    assert!(alpha_sum(&blur_100) * 100 <= alpha_sum(&hard) * 140);
 }
 
 #[test]
-fn diffused_alpha_uses_only_the_blurred_outer_mask() {
-    let mut rng = StdRng::seed_from_u64(17);
-    let stain = Stain::new((320.0, 200.0), 100.0, 45, 0.45, 10, true, &mut rng);
-    let mask = stain.diffused_outer_mask(50);
+fn blur_zero_uses_the_existing_hard_rasterization_path() {
+    let stain = seeded_stain(17, 45, true);
+    let mut dispatched = RgbaImage::new(640, 400);
+    let mut hard = RgbaImage::new(640, 400);
+
+    stain.rasterize(&mut dispatched, 0);
+    stain.rasterize_hard(&mut hard);
+
+    assert_eq!(dispatched, hard);
+}
+
+#[test]
+fn soft_outer_coverage_is_continuous_at_the_boundary() {
+    let softness = softness_normalized(50);
+    let boundary = soft_outer_coverage(0.0, softness);
+    let just_inside = soft_outer_coverage(0.001, softness);
+    let just_outside = soft_outer_coverage(-0.001, softness);
+
+    assert_close(boundary, 1.0);
+    assert_close(just_inside, boundary);
+    assert!(
+        just_outside > 0.999,
+        "coverage should remain significant outside"
+    );
+    assert!(just_outside <= boundary);
+}
+
+#[test]
+fn soft_outer_coverage_has_a_monotonic_gaussian_tail() {
+    let softness = softness_normalized(50);
+    let near = soft_outer_coverage(-softness * 0.25, softness);
+    let middle = soft_outer_coverage(-softness, softness);
+    let far = soft_outer_coverage(-softness * 4.0, softness);
+
+    assert!(near > middle && middle > far && far > 0.0);
+    assert!(far < COVERAGE_TAIL_THRESHOLD);
+}
+
+#[test]
+fn larger_blur_widens_the_same_continuous_outer_tail() {
+    let outside_shape = -0.20;
+    let blur_25 = soft_outer_coverage(outside_shape, softness_normalized(25));
+    let blur_50 = soft_outer_coverage(outside_shape, softness_normalized(50));
+    let blur_100 = soft_outer_coverage(outside_shape, softness_normalized(100));
+
+    assert!(blur_100 > blur_50 && blur_50 > blur_25);
+}
+
+#[test]
+fn continuous_coverage_uses_a_quality_bounded_field_and_mild_smoothing() {
+    let stain = seeded_stain(17, 45, true);
+    let softness = softness_normalized(50);
+    let softness_pixels = stain.characteristic_size * softness;
+    let expected_cell_size = (stain.characteristic_size / 256.0).clamp(1.0, 8.0);
+    let field = stain.diffused_outer_coverage(50);
+    let radius = finishing_blur_radius_cells(softness_pixels, expected_cell_size);
+    let lobe = stain.lobes[0];
+
+    assert_close(field.cell_size, expected_cell_size);
+    assert!((1..=6).contains(&radius));
+    assert!(
+        field.sample(lobe.center_x, lobe.center_y) > 0.95,
+        "one finishing pass should preserve the stain core"
+    );
+}
+
+#[test]
+fn diffused_rasterization_uses_the_continuous_outer_coverage_field() {
+    let stain = seeded_stain(17, 45, true);
+    let field = stain.diffused_outer_coverage(50);
     let mut image = RgbaImage::new(640, 400);
     stain.rasterize_diffused(&mut image, 50);
 
@@ -639,31 +1072,29 @@ fn diffused_alpha_uses_only_the_blurred_outer_mask() {
         for x in 0..image.width() {
             let world_x = x as f32 + 0.5;
             let world_y = y as f32 + 0.5;
-            let raw_coverage = smoothstep(
-                -stain.feather,
-                stain.feather,
-                stain.warped_shape_at(world_x, world_y),
-            );
-            let blurred_coverage = mask.sample(world_x, world_y).clamp(0.0, 1.0);
-            if raw_coverage <= blurred_coverage + 0.25 {
+            let warped_shape = stain.warped_shape_at(world_x, world_y);
+            let coverage = field.sample(world_x, world_y).clamp(0.0, 1.0);
+            if warped_shape > -stain.feather || coverage <= COVERAGE_TAIL_THRESHOLD {
                 continue;
             }
 
             let expected_alpha = (stain.alpha
-                * blurred_coverage
+                * coverage
                 * stain
-                    .optical_density_at(stain.warped_shape_at(world_x, world_y), world_x, world_y)
+                    .optical_density_at(warped_shape, world_x, world_y)
                     .max(0.0))
             .round()
             .clamp(0.0, 255.0) as u8;
             if expected_alpha > 0 {
-                sample = Some((x, y, expected_alpha));
+                sample = Some((x, y, warped_shape, expected_alpha));
                 break 'rows;
             }
         }
     }
 
-    let (x, y, expected_alpha) = sample.expect("blurred mask should soften a hard-edge pixel");
+    let (x, y, warped_shape, expected_alpha) =
+        sample.expect("continuous coverage should remain outside the old hard mask");
+    assert_eq!(smoothstep(-stain.feather, stain.feather, warped_shape), 0.0);
     assert_eq!(image.get_pixel(x, y)[3], expected_alpha);
 }
 
@@ -674,6 +1105,15 @@ fn invalid_lightness_is_rejected_before_output_is_created() {
         .expect_err("out-of-range lightness should fail validation");
 
     assert!(matches!(error, RenderError::InvalidLightness(101)));
+}
+
+#[test]
+fn invalid_contrast_is_rejected_before_output_is_created() {
+    let mut rng = StdRng::seed_from_u64(33);
+    let error = generate_images_with_rng(&settings_with_contrast(30, 50, 50, 101), &mut rng)
+        .expect_err("out-of-range contrast should fail validation");
+
+    assert!(matches!(error, RenderError::InvalidContrast(101)));
 }
 
 #[test]

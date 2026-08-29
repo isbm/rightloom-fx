@@ -1,8 +1,8 @@
 use std::str::FromStr;
 
 use super::{
-    Cli, Command, cli, parse_amount, parse_background, parse_blur, parse_density, parse_lightness,
-    parse_scratch_type,
+    Cli, Command, cli, parse_amount, parse_background, parse_blur, parse_contrast, parse_density,
+    parse_lightness, parse_scratch_type,
 };
 use crate::render::{ExportPolicy, RgbColor};
 use crate::scratches::{Resolution, ScratchType};
@@ -53,6 +53,44 @@ fn lightness_is_limited_to_a_percentage() {
 
     assert!(parse_lightness("101").is_err());
     assert!(parse_lightness("-1").is_err());
+}
+
+#[test]
+fn contrast_is_limited_to_a_percentage() {
+    for value in ["0", "1", "25", "50", "75", "99", "100"] {
+        let parsed = parse_contrast(value).expect("in-range contrast should parse");
+        assert_eq!(parsed, value.parse().expect("test value should be numeric"));
+    }
+
+    assert!(parse_contrast("101").is_err());
+    assert!(parse_contrast("-1").is_err());
+}
+
+#[test]
+fn stain_cli_accepts_contrast_endpoints_and_default() {
+    for contrast in [0, 50, 100] {
+        let cli = Cli::try_parse_from([
+            "rightloom-fx".to_owned(),
+            "stain".to_owned(),
+            "-r".to_owned(),
+            "320x200".to_owned(),
+            "-d".to_owned(),
+            "10".to_owned(),
+            "-c".to_owned(),
+            contrast.to_string(),
+            "-a".to_owned(),
+            "1".to_owned(),
+            "-o".to_owned(),
+            "output".to_owned(),
+        ])
+        .expect("in-range contrast should parse");
+
+        let parsed = match cli.command {
+            Command::Stain(args) => args.contrast,
+            Command::Scratches(_) => panic!("stain command should parse as stain"),
+        };
+        assert_eq!(parsed, contrast);
+    }
 }
 
 #[test]
@@ -118,11 +156,12 @@ fn stain_cli_accepts_exact_resolution() {
         "output",
     ])
     .expect("exact resolution should parse");
-    let (resolution, blur, lightness, export_policy) = match cli.command {
+    let (resolution, blur, lightness, contrast, export_policy) = match cli.command {
         Command::Stain(args) => (
             args.render.resolution,
             args.blur,
             args.lightness,
+            args.contrast,
             args.render.export_policy,
         ),
         Command::Scratches(_) => panic!("stain command should parse as stain"),
@@ -131,6 +170,7 @@ fn stain_cli_accepts_exact_resolution() {
     assert_eq!((resolution.width(), resolution.height()), (6240, 4160));
     assert_eq!(blur, 50);
     assert_eq!(lightness, 10);
+    assert_eq!(contrast, 50);
     assert_eq!(export_policy, ExportPolicy::Flatten(RgbColor::BLACK));
 }
 
@@ -147,6 +187,8 @@ fn stain_cli_accepts_aspect_ratio_resolution() {
         "100",
         "-l",
         "100",
+        "-c",
+        "75",
         "--background=ffffff",
         "-a",
         "1",
@@ -154,11 +196,12 @@ fn stain_cli_accepts_aspect_ratio_resolution() {
         "output",
     ])
     .expect("aspect ratio should parse");
-    let (resolution, blur, lightness, export_policy) = match cli.command {
+    let (resolution, blur, lightness, contrast, export_policy) = match cli.command {
         Command::Stain(args) => (
             args.render.resolution,
             args.blur,
             args.lightness,
+            args.contrast,
             args.render.export_policy,
         ),
         Command::Scratches(_) => panic!("stain command should parse as stain"),
@@ -167,6 +210,7 @@ fn stain_cli_accepts_aspect_ratio_resolution() {
     assert_eq!((resolution.width(), resolution.height()), (4160, 6240));
     assert_eq!(blur, 100);
     assert_eq!(lightness, 100);
+    assert_eq!(contrast, 75);
     assert_eq!(
         export_policy,
         ExportPolicy::Flatten(RgbColor::new(255, 255, 255))
@@ -245,7 +289,7 @@ fn scratches_help_lists_supported_types() {
 }
 
 #[test]
-fn stain_help_documents_blur_and_lightness() {
+fn stain_help_documents_blur_lightness_and_contrast() {
     let command = cli();
     let error = command
         .try_get_matches_from(["rightloom-fx", "stain", "--help"])
@@ -260,12 +304,16 @@ fn stain_help_documents_blur_and_lightness() {
     assert!(help.contains("10 matches the current/default appearance."));
     assert!(help.contains("0 = nearly black, 100 = near-white."));
     assert!(help.contains("[default: 10]"));
+    assert!(help.contains("-c, --contrast <PERCENT>"));
+    assert!(help.contains("Internal stain contrast, 0-100."));
+    assert!(help.contains("50 preserves the default/current contrast."));
+    assert!(help.contains("[default: 50]"));
     assert!(help.contains("--alpha"));
     assert!(help.contains("--background <RRGGBB>"));
 }
 
 #[test]
-fn scratches_help_does_not_expose_lightness() {
+fn scratches_help_does_not_expose_stain_only_controls() {
     let command = cli();
     let error = command
         .try_get_matches_from(["rightloom-fx", "scratches", "--help"])
@@ -273,6 +321,7 @@ fn scratches_help_does_not_expose_lightness() {
     let help = error.to_string();
 
     assert!(!help.contains("--lightness"));
+    assert!(!help.contains("--contrast"));
 }
 
 #[test]
@@ -341,6 +390,28 @@ fn scratches_reject_stain_lightness() {
 }
 
 #[test]
+fn scratches_reject_stain_contrast() {
+    let result = Cli::try_parse_from([
+        "rightloom-fx",
+        "scratches",
+        "-r",
+        "320x200",
+        "-d",
+        "10",
+        "-t",
+        "dust",
+        "-c",
+        "50",
+        "-a",
+        "1",
+        "-o",
+        "output",
+    ]);
+
+    assert!(result.is_err());
+}
+
+#[test]
 fn stain_rejects_out_of_range_blur() {
     let result = Cli::try_parse_from([
         "rightloom-fx",
@@ -370,6 +441,26 @@ fn stain_rejects_out_of_range_lightness() {
         "-d",
         "10",
         "-l",
+        "101",
+        "-a",
+        "1",
+        "-o",
+        "output",
+    ]);
+
+    assert!(result.is_err());
+}
+
+#[test]
+fn stain_rejects_out_of_range_contrast() {
+    let result = Cli::try_parse_from([
+        "rightloom-fx",
+        "stain",
+        "-r",
+        "320x200",
+        "-d",
+        "10",
+        "-c",
         "101",
         "-a",
         "1",

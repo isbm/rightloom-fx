@@ -32,6 +32,7 @@ pub(crate) struct StainArgs {
     pub(crate) render: RenderSettings,
     pub(crate) blur: u8,
     pub(crate) lightness: u8,
+    pub(crate) contrast: u8,
 }
 
 impl Cli {
@@ -70,6 +71,9 @@ impl Cli {
                 lightness: *arguments
                     .get_one("lightness")
                     .expect("clap supplies the stain lightness default"),
+                contrast: *arguments
+                    .get_one("contrast")
+                    .expect("clap supplies the stain contrast default"),
             }),
             _ => unreachable!("clap only exposes configured subcommands"),
         };
@@ -179,6 +183,15 @@ fn stain_command(styles: styling::Styles) -> ClapCommand {
                     .help("Stain brightness, 0-100.\n10 matches the current/default appearance.\n0 = nearly black, 100 = near-white.")
                     .default_value("10")
                     .value_parser(parse_lightness),
+            )
+            .arg(
+                Arg::new("contrast")
+                    .short('c')
+                    .long("contrast")
+                    .value_name("PERCENT")
+                    .help("Internal stain contrast, 0-100.\n50 preserves the default/current contrast.")
+                    .default_value("50")
+                    .value_parser(parse_contrast),
             ),
     )
 }
@@ -295,6 +308,18 @@ pub(crate) fn parse_lightness(value: &str) -> Result<u8, String> {
     }
 
     Ok(lightness as u8)
+}
+
+pub(crate) fn parse_contrast(value: &str) -> Result<u8, String> {
+    let contrast = value
+        .parse::<u16>()
+        .map_err(|_| "contrast must be an integer between 0 and 100".to_owned())?;
+
+    if contrast > 100 {
+        return Err("contrast must be between 0 and 100".to_owned());
+    }
+
+    Ok(contrast as u8)
 }
 
 pub(crate) fn parse_background(value: &str) -> Result<RgbColor, String> {
