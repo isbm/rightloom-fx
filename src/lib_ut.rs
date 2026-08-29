@@ -174,3 +174,39 @@ fn bokeh_command_writes_numbered_pngs_through_shared_output_handling() {
         assert!(image.to_rgba8().pixels().all(|pixel| pixel[3] == 255));
     }
 }
+
+#[test]
+fn bokeh_edge_rejects_center_placement_before_writing_output() {
+    let output = TestOutputDir::new();
+    let output_argument = output.path().to_string_lossy().into_owned();
+
+    let error = run_from([
+        "rightloom-fx",
+        "bokeh",
+        "-r",
+        "320x200",
+        "-t",
+        "edge",
+        "-p",
+        "center",
+        "-d",
+        "50",
+        "-a",
+        "1",
+        "-o",
+        output_argument.as_str(),
+    ])
+    .expect_err("edge bokeh center placement should fail");
+
+    assert!(
+        error
+            .to_string()
+            .contains("center placement is not available for edge bokeh")
+    );
+    assert!(
+        fs::read_dir(output.path())
+            .expect("test directory should be readable")
+            .next()
+            .is_none()
+    );
+}

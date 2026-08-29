@@ -250,6 +250,7 @@ pub enum RenderError {
     InvalidAmount,
     NoEffects,
     NoBokehTypes,
+    InvalidBokehEdgePlacement,
     CreateOutput {
         path: PathBuf,
         source: io::Error,
@@ -308,6 +309,12 @@ impl fmt::Display for RenderError {
             Self::InvalidAmount => write!(formatter, "amount must be at least 1"),
             Self::NoEffects => write!(formatter, "at least one scratch type must be supplied"),
             Self::NoBokehTypes => write!(formatter, "at least one bokeh type must be supplied"),
+            Self::InvalidBokehEdgePlacement => {
+                write!(
+                    formatter,
+                    "center placement is not available for edge bokeh"
+                )
+            }
             Self::CreateOutput { path, source } => {
                 write!(
                     formatter,

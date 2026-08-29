@@ -34,6 +34,7 @@ fn run_cli(cli: Cli) -> Result<(), RenderError> {
             render: args.render,
             types: args.types,
             placements: args.placements,
+            blur: args.blur,
             size: args.size,
             uniform: args.uniform,
         }),

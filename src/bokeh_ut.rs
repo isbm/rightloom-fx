@@ -56,6 +56,7 @@ fn settings(
         },
         types: types.to_vec(),
         placements: placements.to_vec(),
+        blur: 100,
         size,
         uniform,
     }
@@ -93,7 +94,7 @@ fn export_bokeh(export_policy: ExportPolicy) -> (RgbaImage, RgbaImage) {
 
     let source_settings = settings(
         &[BokehType::Twinkle, BokehType::Edge, BokehType::Damage],
-        &[BokehPlacement::Center, BokehPlacement::Left],
+        &[BokehPlacement::Left],
         50,
         60,
         35,
@@ -163,6 +164,23 @@ fn bokeh_settings_validate_size_and_uniformity() {
     assert!(matches!(
         invalid_size.validate(),
         Err(RenderError::InvalidUniform(101))
+    ));
+}
+
+#[test]
+fn bokeh_settings_validate_blur_and_edge_placement() {
+    let mut invalid_blur = settings(&[BokehType::Twinkle], &[], 50, 50, 50);
+    invalid_blur.blur = 101;
+    assert!(matches!(
+        invalid_blur.validate(),
+        Err(RenderError::InvalidBlur(101))
+    ));
+
+    let invalid_edge_placement =
+        settings(&[BokehType::Edge], &[BokehPlacement::Center], 50, 50, 50);
+    assert!(matches!(
+        invalid_edge_placement.validate(),
+        Err(RenderError::InvalidBokehEdgePlacement)
     ));
 }
 
@@ -318,14 +336,14 @@ fn twinkle_center_is_stronger_than_its_distant_falloff() {
         glow_phase: 0.0,
     };
     let mut effects = vec![0.0; 100 * 100];
-    twinkle.rasterize(&mut effects, 100, 100);
+    twinkle.rasterize(&mut effects, 100, 100, BlurParameters::new(100, 100, 100));
 
     assert!(effect_at(&effects, 100, 50, 50) > effect_at(&effects, 100, 70, 50));
     assert!(effect_at(&effects, 100, 70, 50) > effect_at(&effects, 100, 90, 50));
 }
 
 #[test]
-fn twinkle_radial_falloff_is_smooth_and_not_binary() {
+fn twinkle_uses_a_smooth_pancake_profile_with_a_brighter_rim() {
     let twinkle = Twinkle {
         center_x: 60.0,
         center_y: 40.0,
@@ -340,15 +358,50 @@ fn twinkle_radial_falloff_is_smooth_and_not_binary() {
         glow_phase: 0.0,
     };
     let mut effects = vec![0.0; 120 * 80];
-    twinkle.rasterize(&mut effects, 120, 80);
+    twinkle.rasterize(&mut effects, 120, 80, BlurParameters::new(0, 120, 80));
     let samples: Vec<_> = (60..=96).map(|x| effect_at(&effects, 120, x, 40)).collect();
     let quantized: BTreeSet<_> = samples
         .iter()
         .map(|value| (value * 10_000.0).round() as i32)
         .collect();
 
-    assert!(samples.windows(2).all(|pair| pair[0] >= pair[1]));
-    assert!(quantized.len() > 12, "falloff should contain smooth values");
+    assert!(effect_at(&effects, 120, 78, 40) > effect_at(&effects, 120, 60, 40));
+    assert!(
+        quantized.len() > 12,
+        "pancake edge should remain antialiased"
+    );
+}
+
+#[test]
+fn twinkle_blur_changes_only_its_outer_transition() {
+    let twinkle = Twinkle {
+        center_x: 60.0,
+        center_y: 40.0,
+        radius_x: 24.0,
+        radius_y: 24.0,
+        sin_angle: 0.0,
+        cos_angle: 1.0,
+        intensity: 0.6,
+        deformation: 0.0,
+        deformation_frequency: 2.0,
+        deformation_phase: 0.0,
+        glow_phase: 0.0,
+    };
+    let mut sharp = vec![0.0; 120 * 80];
+    twinkle.rasterize(&mut sharp, 120, 80, BlurParameters::new(0, 120, 80));
+    let mut soft = vec![0.0; 120 * 80];
+    twinkle.rasterize(&mut soft, 120, 80, BlurParameters::new(100, 120, 80));
+
+    assert_close(
+        effect_at(&sharp, 120, 60, 40),
+        effect_at(&soft, 120, 60, 40),
+    );
+    assert_close(
+        effect_at(&sharp, 120, 70, 40),
+        effect_at(&soft, 120, 70, 40),
+    );
+    assert_eq!(effect_at(&sharp, 120, 90, 40), 0.0);
+    assert!(effect_at(&soft, 120, 90, 40) > 0.0);
 }
 
 #[test]
@@ -376,7 +429,7 @@ fn partial_off_frame_twinkles_render_inside_the_image() {
         glow_phase: 0.0,
     };
     let mut effects = vec![0.0; 100 * 60];
-    twinkle.rasterize(&mut effects, 100, 60);
+    twinkle.rasterize(&mut effects, 100, 60, BlurParameters::new(100, 100, 60));
 
     assert!(effect_at(&effects, 100, 0, 30) > 0.0);
     assert!(effects.iter().any(|effect| *effect > 0.0));
@@ -386,13 +439,18 @@ fn edge_exposure(direction: EdgeDirection) -> EdgeExposure {
     EdgeExposure {
         direction,
         penetration: 28.0,
-        center: 50.0,
         intensity: 0.6,
-        width_variation: 0.0,
-        width_cycles: 0.5,
-        width_phase: 0.0,
-        cloud_cycles: 0.5,
-        cloud_phase: 0.0,
+        broad_profile: EdgeProfile {
+            values: vec![0.0, 0.0],
+        },
+        torn_profile: EdgeProfile {
+            values: vec![0.0, 0.0],
+        },
+        brightness_profile: EdgeProfile {
+            values: vec![0.0, 0.0],
+        },
+        broad_depth_variation: 0.15,
+        brightness_variation: 0.15,
         bright_center: 0.5,
         bright_spread: 0.2,
         bright_strength: 0.4,
@@ -408,7 +466,12 @@ fn each_edge_direction_is_strongest_near_its_selected_side() {
         (EdgeDirection::Bottom, (50, 98), (50, 10)),
     ] {
         let mut effects = vec![0.0; 100 * 100];
-        edge_exposure(direction).rasterize(&mut effects, 100, 100);
+        edge_exposure(direction).rasterize(
+            &mut effects,
+            100,
+            100,
+            BlurParameters::new(100, 100, 100),
+        );
         assert!(
             effect_at(&effects, 100, near.0, near.1) > effect_at(&effects, 100, far.0, far.1),
             "{direction:?} should be strongest near its chosen side"
@@ -417,11 +480,79 @@ fn each_edge_direction_is_strongest_near_its_selected_side() {
 }
 
 #[test]
+fn edge_profiles_use_seeded_nonperiodic_control_points() {
+    let settings = settings(&[BokehType::Edge], &[BokehPlacement::Left], 70, 70, 50);
+    let mut rng = StdRng::seed_from_u64(82);
+    let exposures = generate_edge_exposures(&settings, 1_000, 667, &mut rng);
+
+    assert!(!exposures.is_empty());
+    for exposure in exposures {
+        assert!((3..=7).contains(&(exposure.broad_profile.values.len() - 1)));
+        assert!((8..=20).contains(&(exposure.torn_profile.values.len() - 1)));
+        assert_eq!(exposure.broad_depth_variation, 0.15);
+        assert!(
+            exposure
+                .broad_profile
+                .values
+                .iter()
+                .all(|value| (-1.0..=1.0).contains(value))
+        );
+        assert!(
+            exposure
+                .torn_profile
+                .values
+                .iter()
+                .all(|value| value.abs() <= 0.18)
+        );
+    }
+}
+
+#[test]
+fn torn_profiles_keep_strong_excursions_local_and_bounded() {
+    let mut rng = StdRng::seed_from_u64(93);
+    let profile = EdgeProfile::random_torn(100, &mut rng);
+
+    assert!(profile.values.iter().all(|value| value.abs() <= 0.18));
+    assert!(profile.values.iter().any(|value| value.abs() >= 0.15));
+}
+
+#[test]
+fn edge_blur_uses_the_required_softness_range_and_preserves_inner_brightness() {
+    let edge = EdgeExposure {
+        penetration: 240.0,
+        ..edge_exposure(EdgeDirection::Left)
+    };
+    let sharp = BlurParameters::new(0, 1_000, 667);
+    let soft = BlurParameters::new(100, 1_000, 667);
+
+    assert_close(sharp.edge_softness, 2.0);
+    assert_close(soft.edge_softness, 80.0);
+    assert_close(
+        edge.contribution(0.5, edge.penetration, 1.0, sharp),
+        edge.contribution(0.5, edge.penetration, 1.0, soft),
+    );
+    assert_eq!(
+        edge.contribution(edge.penetration + 4.0, edge.penetration, 1.0, sharp),
+        0.0
+    );
+    assert!(edge.contribution(edge.penetration + 4.0, edge.penetration, 1.0, soft) > 0.0);
+    assert!(soft_rectangle_coverage(0.0, sharp.edge_softness) > 0.0);
+    assert!(soft_rectangle_coverage(0.0, sharp.edge_softness) < 1.0);
+}
+
+#[test]
 fn edge_fade_is_monotonic_before_low_frequency_modulation() {
     let edge = edge_exposure(EdgeDirection::Left);
     let values: Vec<_> = [0.0, 8.0, 16.0, 24.0, 32.0]
         .into_iter()
-        .map(|distance| edge.contribution(distance, edge.penetration, 1.0))
+        .map(|distance| {
+            edge.contribution(
+                distance,
+                edge.penetration,
+                1.0,
+                BlurParameters::new(100, 100, 100),
+            )
+        })
         .collect();
 
     assert!(values.windows(2).all(|pair| pair[0] > pair[1]));
@@ -430,9 +561,12 @@ fn edge_fade_is_monotonic_before_low_frequency_modulation() {
 #[test]
 fn edge_modulation_changes_smoothly_without_hard_stripes() {
     let edge = EdgeExposure {
-        width_variation: 0.24,
-        width_cycles: 1.7,
-        cloud_cycles: 0.8,
+        broad_profile: EdgeProfile {
+            values: vec![-0.7, 0.45, -0.2, 0.85],
+        },
+        torn_profile: EdgeProfile {
+            values: vec![0.06, -0.08, 0.03, -0.04, 0.07, -0.02, 0.05, -0.06, 0.02],
+        },
         ..edge_exposure(EdgeDirection::Left)
     };
     let depths: Vec<_> = (0..1_000)
@@ -446,6 +580,41 @@ fn edge_modulation_changes_smoothly_without_hard_stripes() {
     assert!(
         greatest_step < 0.2,
         "edge modulation should remain low frequency"
+    );
+}
+
+#[test]
+fn blur_does_not_change_seeded_primitive_geometry() {
+    let mut sharp = settings(
+        &[BokehType::Twinkle, BokehType::Edge, BokehType::Damage],
+        &[BokehPlacement::Left],
+        70,
+        65,
+        35,
+    );
+    sharp.blur = 0;
+    let mut soft = sharp.clone();
+    soft.blur = 100;
+
+    let mut sharp_rng = StdRng::seed_from_u64(83);
+    let mut soft_rng = StdRng::seed_from_u64(83);
+    assert_eq!(
+        generate_twinkles(&sharp, 1_000, 667, &mut sharp_rng),
+        generate_twinkles(&soft, 1_000, 667, &mut soft_rng)
+    );
+
+    let mut sharp_rng = StdRng::seed_from_u64(84);
+    let mut soft_rng = StdRng::seed_from_u64(84);
+    assert_eq!(
+        generate_edge_exposures(&sharp, 1_000, 667, &mut sharp_rng),
+        generate_edge_exposures(&soft, 1_000, 667, &mut soft_rng)
+    );
+
+    let mut sharp_rng = StdRng::seed_from_u64(85);
+    let mut soft_rng = StdRng::seed_from_u64(85);
+    assert_eq!(
+        generate_damage_segments(&sharp, 1_000, 667, &mut sharp_rng),
+        generate_damage_segments(&soft, 1_000, 667, &mut soft_rng)
     );
 }
 
@@ -485,7 +654,7 @@ fn damage_boundaries_are_soft_and_not_binary_rectangles() {
         fragment_phase: 0.4,
     };
     let mut effects = vec![0.0; 120 * 80];
-    segment.rasterize(&mut effects, 120, 80);
+    segment.rasterize(&mut effects, 120, 80, BlurParameters::new(100, 120, 80));
     let levels: BTreeSet<_> = effects
         .iter()
         .filter(|effect| **effect > 0.0)
@@ -498,6 +667,38 @@ fn damage_boundaries_are_soft_and_not_binary_rectangles() {
         levels.len() > 16,
         "damage should contain soft intermediate values"
     );
+}
+
+#[test]
+fn damage_blur_changes_only_the_boundary_feather() {
+    let segment = DamageSegment {
+        center_x: 60.0,
+        center_y: 40.0,
+        half_width: 25.0,
+        half_height: 14.0,
+        sin_angle: 0.0,
+        cos_angle: 1.0,
+        intensity: 0.7,
+        softness: 6.0,
+        deformation: 0.0,
+        x_frequency: 0.7,
+        y_frequency: 0.9,
+        x_phase: 0.2,
+        y_phase: 1.1,
+        fragment_frequency: 0.6,
+        fragment_phase: 0.4,
+    };
+    let mut sharp = vec![0.0; 120 * 80];
+    segment.rasterize(&mut sharp, 120, 80, BlurParameters::new(0, 120, 80));
+    let mut soft = vec![0.0; 120 * 80];
+    segment.rasterize(&mut soft, 120, 80, BlurParameters::new(100, 120, 80));
+
+    assert_close(
+        effect_at(&sharp, 120, 60, 40),
+        effect_at(&soft, 120, 60, 40),
+    );
+    assert_eq!(effect_at(&sharp, 120, 88, 40), 0.0);
+    assert!(effect_at(&soft, 120, 88, 40) > 0.0);
 }
 
 #[test]
@@ -535,7 +736,7 @@ fn scalar_accumulation_has_the_required_union_behavior() {
 fn bokeh_rendering_is_seeded_deterministic_and_monochrome() {
     let settings = settings(
         &[BokehType::Twinkle, BokehType::Edge, BokehType::Damage],
-        &[BokehPlacement::Center, BokehPlacement::Left],
+        &[BokehPlacement::Left],
         50,
         70,
         25,

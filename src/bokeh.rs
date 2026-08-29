@@ -6,7 +6,6 @@ use rand::Rng;
 use crate::render::{RenderError, RenderSettings, write_images};
 
 const TAIL_THRESHOLD: f32 = 1e-4;
-const TWINKLE_FALLOFF: f32 = 2.1;
 const EDGE_FALLOFF: f32 = 2.7;
 const TWINKLE_COUNT_ANCHORS: [(u8, usize); 7] = [
     (0, 0),
@@ -103,6 +102,7 @@ pub struct BokehSettings {
     pub render: RenderSettings,
     pub types: Vec<BokehType>,
     pub placements: Vec<BokehPlacement>,
+    pub blur: u8,
     pub size: u8,
     pub uniform: u8,
 }
@@ -111,6 +111,14 @@ impl BokehSettings {
     fn validate(&self) -> Result<(), RenderError> {
         if self.types.is_empty() {
             return Err(RenderError::NoBokehTypes);
+        }
+        if self.types.contains(&BokehType::Edge)
+            && self.placements.contains(&BokehPlacement::Center)
+        {
+            return Err(RenderError::InvalidBokehEdgePlacement);
+        }
+        if self.blur > 100 {
+            return Err(RenderError::InvalidBlur(self.blur));
         }
         if self.size > 100 {
             return Err(RenderError::InvalidSize(self.size));
@@ -139,6 +147,7 @@ fn generate_images_with_rng<R: Rng + ?Sized>(
 fn render_image<R: Rng + ?Sized>(settings: &BokehSettings, rng: &mut R) -> RgbaImage {
     let width = settings.render.resolution.width();
     let height = settings.render.resolution.height();
+    let blur = BlurParameters::new(settings.blur, width, height);
     let mut effects = vec![0.0; width as usize * height as usize];
 
     if settings.render.density == 0 {
@@ -149,17 +158,17 @@ fn render_image<R: Rng + ?Sized>(settings: &BokehSettings, rng: &mut R) -> RgbaI
         match bokeh_type {
             BokehType::Twinkle => {
                 for twinkle in generate_twinkles(settings, width, height, rng) {
-                    twinkle.rasterize(&mut effects, width, height);
+                    twinkle.rasterize(&mut effects, width, height, blur);
                 }
             }
             BokehType::Edge => {
                 for exposure in generate_edge_exposures(settings, width, height, rng) {
-                    exposure.rasterize(&mut effects, width, height);
+                    exposure.rasterize(&mut effects, width, height, blur);
                 }
             }
             BokehType::Damage => {
                 for segment in generate_damage_segments(settings, width, height, rng) {
-                    segment.rasterize(&mut effects, width, height);
+                    segment.rasterize(&mut effects, width, height, blur);
                 }
             }
         }
@@ -191,6 +200,37 @@ fn scalar_effects_to_image(effects: &[f32], width: u32, height: u32) -> RgbaImag
     }
 
     image
+}
+
+#[derive(Debug, Clone, Copy)]
+struct BlurParameters {
+    fraction: f32,
+    edge_softness: f32,
+}
+
+impl BlurParameters {
+    fn new(blur: u8, width: u32, height: u32) -> Self {
+        let fraction = f32::from(blur) / 100.0;
+        let longest_side = width.max(height) as f32;
+        let minimum_edge_softness = (0.002 * longest_side).max(1.0);
+
+        Self {
+            fraction,
+            edge_softness: lerp(minimum_edge_softness, 0.08 * longest_side, fraction),
+        }
+    }
+
+    fn twinkle_softness(self, radius: f32) -> f32 {
+        lerp(
+            (radius * 0.018).max(1.0),
+            (radius * 0.30).max(1.0),
+            self.fraction,
+        )
+    }
+}
+
+fn lerp(start: f32, end: f32, progress: f32) -> f32 {
+    start + (end - start) * progress
 }
 
 fn twinkle_count(density: u8) -> usize {
@@ -310,9 +350,10 @@ struct Twinkle {
 }
 
 impl Twinkle {
-    fn rasterize(&self, effects: &mut [f32], width: u32, height: u32) {
-        let tail = ((self.intensity / TAIL_THRESHOLD).ln() / TWINKLE_FALLOFF).sqrt()
-            * (1.0 + self.deformation);
+    fn rasterize(&self, effects: &mut [f32], width: u32, height: u32, blur: BlurParameters) {
+        let nominal_radius = self.radius_x.min(self.radius_y);
+        let softness = blur.twinkle_softness(nominal_radius);
+        let tail = (1.0 + softness / nominal_radius) * (1.0 + self.deformation);
         let extent_x =
             (self.cos_angle.abs() * self.radius_x + self.sin_angle.abs() * self.radius_y) * tail;
         let extent_y =
@@ -339,12 +380,15 @@ impl Twinkle {
                     + self.deformation
                         * (self.deformation_frequency * angle + self.deformation_phase).sin();
                 let d2 = (local_x / self.radius_x).powi(2) + (local_y / self.radius_y).powi(2);
+                let normalized_distance = d2.sqrt() / radial_adjustment;
                 let coverage =
-                    (-TWINKLE_FALLOFF * d2 / (radial_adjustment * radial_adjustment)).exp();
-                let glow = (0.90
-                    + 0.07 * (local_x / self.radius_x * 2.1 + self.glow_phase).sin()
-                    + 0.05 * (local_y / self.radius_y * 1.7 - self.glow_phase).sin())
-                .clamp(0.75, 1.05);
+                    soft_rectangle_coverage((normalized_distance - 1.0) * nominal_radius, softness);
+                let rim = smoothstep(0.52, 0.90, normalized_distance);
+                let glow = (0.74
+                    + 0.14 * rim
+                    + 0.04 * (local_x / self.radius_x * 2.1 + self.glow_phase).sin()
+                    + 0.03 * (local_y / self.radius_y * 1.7 - self.glow_phase).sin())
+                .clamp(0.66, 0.98);
                 let contribution = self.intensity * coverage * glow;
                 if contribution >= TAIL_THRESHOLD {
                     accumulate_pixel(effects, width, x, y, contribution);
@@ -395,70 +439,136 @@ fn generate_twinkles<R: Rng + ?Sized>(
     twinkles
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EdgeDirection {
     Left,
     Right,
     Top,
     Bottom,
-    VerticalBand,
-    HorizontalBand,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StripMode {
     Start,
     End,
-    Center,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
+struct EdgeProfile {
+    values: Vec<f32>,
+}
+
+impl EdgeProfile {
+    fn random<R: Rng + ?Sized>(changes: usize, rng: &mut R) -> Self {
+        let mut value: f32 = rng.random_range(-0.60..=0.60);
+        let mut values = Vec::with_capacity(changes + 1);
+        values.push(value);
+        for _ in 0..changes {
+            // Correlated controls keep sharp boundaries torn rather than saw-toothed.
+            value = (value + rng.random_range(-0.55..=0.55)).clamp(-1.0, 1.0);
+            values.push(value);
+        }
+
+        Self { values }
+    }
+
+    fn random_torn<R: Rng + ?Sized>(changes: usize, rng: &mut R) -> Self {
+        let mut value: f32 = rng.random_range(-0.06..=0.06);
+        let mut values = Vec::with_capacity(changes + 1);
+        values.push(value);
+        for _ in 0..changes {
+            value = if rng.random_bool(0.18) {
+                let amplitude = rng.random_range(0.15..=0.18);
+                if rng.random_bool(0.5) {
+                    -amplitude
+                } else {
+                    amplitude
+                }
+            } else {
+                (value + rng.random_range(-0.05..=0.05)).clamp(-0.10, 0.10)
+            };
+            values.push(value);
+        }
+
+        Self { values }
+    }
+
+    fn sample(&self, position: f32) -> f32 {
+        debug_assert!(self.values.len() >= 2);
+        let segments = self.values.len() - 1;
+        let scaled = position.clamp(0.0, 1.0) * segments as f32;
+        let index = scaled.floor() as usize;
+        if index >= segments {
+            return self.values[segments];
+        }
+        let previous = self.values[index.saturating_sub(1)];
+        let current = self.values[index];
+        let next = self.values[index + 1];
+        let following = self.values[(index + 2).min(segments)];
+        let progress = scaled - index as f32;
+        let progress_squared = progress * progress;
+        let progress_cubed = progress_squared * progress;
+        let interpolated = 0.5
+            * ((2.0 * current)
+                + (-previous + next) * progress
+                + (2.0 * previous - 5.0 * current + 4.0 * next - following) * progress_squared
+                + (-previous + 3.0 * current - 3.0 * next + following) * progress_cubed);
+
+        interpolated.clamp(
+            previous.min(current).min(next).min(following),
+            previous.max(current).max(next).max(following),
+        )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
 struct EdgeExposure {
     direction: EdgeDirection,
     penetration: f32,
-    center: f32,
     intensity: f32,
-    width_variation: f32,
-    width_cycles: f32,
-    width_phase: f32,
-    cloud_cycles: f32,
-    cloud_phase: f32,
+    broad_profile: EdgeProfile,
+    torn_profile: EdgeProfile,
+    brightness_profile: EdgeProfile,
+    broad_depth_variation: f32,
+    brightness_variation: f32,
     bright_center: f32,
     bright_spread: f32,
     bright_strength: f32,
 }
 
 impl EdgeExposure {
-    fn rasterize(&self, effects: &mut [f32], width: u32, height: u32) {
+    fn rasterize(&self, effects: &mut [f32], width: u32, height: u32, blur: BlurParameters) {
         match self.direction {
             EdgeDirection::Left => {
-                self.rasterize_vertical(effects, width, height, StripMode::Start)
+                self.rasterize_vertical(effects, width, height, StripMode::Start, blur)
             }
-            EdgeDirection::Right => self.rasterize_vertical(effects, width, height, StripMode::End),
-            EdgeDirection::VerticalBand => {
-                self.rasterize_vertical(effects, width, height, StripMode::Center)
+            EdgeDirection::Right => {
+                self.rasterize_vertical(effects, width, height, StripMode::End, blur)
             }
             EdgeDirection::Top => {
-                self.rasterize_horizontal(effects, width, height, StripMode::Start)
+                self.rasterize_horizontal(effects, width, height, StripMode::Start, blur)
             }
             EdgeDirection::Bottom => {
-                self.rasterize_horizontal(effects, width, height, StripMode::End)
-            }
-            EdgeDirection::HorizontalBand => {
-                self.rasterize_horizontal(effects, width, height, StripMode::Center)
+                self.rasterize_horizontal(effects, width, height, StripMode::End, blur)
             }
         }
     }
 
-    fn rasterize_vertical(&self, effects: &mut [f32], width: u32, height: u32, mode: StripMode) {
+    fn rasterize_vertical(
+        &self,
+        effects: &mut [f32],
+        width: u32,
+        height: u32,
+        mode: StripMode,
+        blur: BlurParameters,
+    ) {
         for y in 0..height {
-            let (depth, cloud) = self.modulation(y as f32 / height as f32);
-            let extent = self.tail_extent(depth);
-            let (start_x, end_x) = strip_bounds(width, self.center, extent, mode);
+            let (depth, brightness) = self.modulation(y as f32 / height as f32);
+            let (start_x, end_x) = strip_bounds(width, self.tail_extent(depth, blur), mode);
 
             for x in start_x..=end_x {
-                let distance = strip_distance(x as f32 + 0.5, width as f32, self.center, mode);
-                let contribution = self.contribution(distance, depth, cloud);
+                let distance = strip_distance(x as f32 + 0.5, width as f32, mode);
+                let contribution = self.contribution(distance, depth, brightness, blur);
                 if contribution >= TAIL_THRESHOLD {
                     accumulate_pixel(effects, width, x, y, contribution);
                 }
@@ -466,15 +576,21 @@ impl EdgeExposure {
         }
     }
 
-    fn rasterize_horizontal(&self, effects: &mut [f32], width: u32, height: u32, mode: StripMode) {
+    fn rasterize_horizontal(
+        &self,
+        effects: &mut [f32],
+        width: u32,
+        height: u32,
+        mode: StripMode,
+        blur: BlurParameters,
+    ) {
         for x in 0..width {
-            let (depth, cloud) = self.modulation(x as f32 / width as f32);
-            let extent = self.tail_extent(depth);
-            let (start_y, end_y) = strip_bounds(height, self.center, extent, mode);
+            let (depth, brightness) = self.modulation(x as f32 / width as f32);
+            let (start_y, end_y) = strip_bounds(height, self.tail_extent(depth, blur), mode);
 
             for y in start_y..=end_y {
-                let distance = strip_distance(y as f32 + 0.5, height as f32, self.center, mode);
-                let contribution = self.contribution(distance, depth, cloud);
+                let distance = strip_distance(y as f32 + 0.5, height as f32, mode);
+                let contribution = self.contribution(distance, depth, brightness, blur);
                 if contribution >= TAIL_THRESHOLD {
                     accumulate_pixel(effects, width, x, y, contribution);
                 }
@@ -483,41 +599,42 @@ impl EdgeExposure {
     }
 
     fn modulation(&self, position: f32) -> (f32, f32) {
-        let width_wave =
-            (position * self.width_cycles * std::f32::consts::TAU + self.width_phase).sin() * 0.62
-                + (position * self.width_cycles * 0.47 * std::f32::consts::TAU
-                    - self.width_phase * 0.6)
-                    .sin()
-                    * 0.38;
-        let depth = (self.penetration * (1.0 + self.width_variation * width_wave)).max(0.5);
-        let cloud_wave =
-            (position * self.cloud_cycles * std::f32::consts::TAU + self.cloud_phase).sin() * 0.68
-                + (position * self.cloud_cycles * 0.43 * std::f32::consts::TAU
-                    - self.cloud_phase * 0.4)
-                    .sin()
-                    * 0.32;
+        let broad_depth =
+            self.penetration * self.broad_depth_variation * self.broad_profile.sample(position);
+        let torn_depth = self.penetration * self.torn_profile.sample(position);
+        let depth = (self.penetration + broad_depth + torn_depth).max(0.5);
         let bloom = (-2.4 * ((position - self.bright_center) / self.bright_spread).powi(2)).exp();
-        let depth = (depth * (0.72 + 0.22 * bloom)).max(0.5);
-        let cloud = (0.38 + 0.22 * cloud_wave + self.bright_strength * bloom).clamp(0.18, 1.0);
+        let brightness = (0.62
+            + self.brightness_variation * self.brightness_profile.sample(position)
+            + self.bright_strength * bloom)
+            .clamp(0.18, 1.0);
 
-        (depth, cloud)
+        (depth, brightness)
     }
 
-    fn tail_extent(&self, depth: f32) -> f32 {
-        depth * ((self.intensity / TAIL_THRESHOLD).ln() / EDGE_FALLOFF).sqrt()
+    fn tail_extent(&self, depth: f32, blur: BlurParameters) -> f32 {
+        depth + blur.edge_softness + 1.0
     }
 
-    fn contribution(&self, distance: f32, depth: f32, cloud: f32) -> f32 {
-        self.intensity * (-EDGE_FALLOFF * (distance / depth).powi(2)).exp() * cloud
+    fn contribution(
+        &self,
+        distance: f32,
+        depth: f32,
+        brightness: f32,
+        blur: BlurParameters,
+    ) -> f32 {
+        let field = (-EDGE_FALLOFF * (distance / depth).powi(2)).exp();
+        let boundary = soft_rectangle_coverage(distance - depth, blur.edge_softness);
+
+        self.intensity * brightness * field * boundary
     }
 }
 
-fn strip_bounds(length: u32, center: f32, extent: f32, mode: StripMode) -> (u32, u32) {
+fn strip_bounds(length: u32, extent: f32, mode: StripMode) -> (u32, u32) {
     let last = length.saturating_sub(1) as f32;
     let (start, end) = match mode {
         StripMode::Start => (0.0, extent),
         StripMode::End => (last - extent, last),
-        StripMode::Center => (center - extent, center + extent),
     };
 
     (
@@ -526,11 +643,10 @@ fn strip_bounds(length: u32, center: f32, extent: f32, mode: StripMode) -> (u32,
     )
 }
 
-fn strip_distance(position: f32, length: f32, center: f32, mode: StripMode) -> f32 {
+fn strip_distance(position: f32, length: f32, mode: StripMode) -> f32 {
     match mode {
         StripMode::Start => position,
         StripMode::End => length - position,
-        StripMode::Center => (position - center).abs(),
     }
 }
 
@@ -548,33 +664,23 @@ fn generate_edge_exposures<R: Rng + ?Sized>(
         let placement = selected_placement(&settings.placements, rng);
         let direction = edge_direction(placement, rng);
         let dimension = match direction {
-            EdgeDirection::Left | EdgeDirection::Right | EdgeDirection::VerticalBand => width,
-            EdgeDirection::Top | EdgeDirection::Bottom | EdgeDirection::HorizontalBand => height,
+            EdgeDirection::Left | EdgeDirection::Right => width,
+            EdgeDirection::Top | EdgeDirection::Bottom => height,
         } as f32;
         let scale = sample_object_scale(settings.size, settings.uniform, rng);
-        let center = match direction {
-            EdgeDirection::VerticalBand => {
-                (0.50 + bell_curve_offset(0.12, rng)).clamp(0.2, 0.8) * width as f32
-            }
-            EdgeDirection::HorizontalBand => {
-                (0.50 + bell_curve_offset(0.12, rng)).clamp(0.2, 0.8) * height as f32
-            }
-            _ => 0.0,
-        };
 
         exposures.push(EdgeExposure {
             direction,
             penetration: (dimension * scale * rng.random_range(0.70..1.02)).max(0.5),
-            center,
             intensity: (rng.random_range(0.30..0.70) * (0.78 + density_scale * 0.45)).min(0.92),
-            width_variation: rng.random_range(0.28..0.48),
-            width_cycles: rng.random_range(0.28..(0.90 + density_scale * 1.25)),
-            width_phase: rng.random_range(0.0..std::f32::consts::TAU),
-            cloud_cycles: rng.random_range(0.35..1.65),
-            cloud_phase: rng.random_range(0.0..std::f32::consts::TAU),
+            broad_profile: EdgeProfile::random(rng.random_range(3..=7), rng),
+            torn_profile: EdgeProfile::random_torn(rng.random_range(8..=20), rng),
+            brightness_profile: EdgeProfile::random(rng.random_range(3..=7), rng),
+            broad_depth_variation: 0.15,
+            brightness_variation: rng.random_range(0.06..0.12),
             bright_center: rng.random_range(0.10..0.90),
             bright_spread: rng.random_range(0.12..0.30),
-            bright_strength: rng.random_range(0.30..0.52),
+            bright_strength: rng.random_range(0.10..0.20),
         });
     }
 
@@ -591,11 +697,7 @@ fn edge_direction<R: Rng + ?Sized>(
         Some(BokehPlacement::Top) => EdgeDirection::Top,
         Some(BokehPlacement::Bottom) => EdgeDirection::Bottom,
         Some(BokehPlacement::Center) => {
-            if rng.random_bool(0.5) {
-                EdgeDirection::VerticalBand
-            } else {
-                EdgeDirection::HorizontalBand
-            }
+            unreachable!("BokehSettings::validate rejects center edge placement")
         }
         None => match rng.random_range(0..4) {
             0 => EdgeDirection::Left,
@@ -626,8 +728,14 @@ struct DamageSegment {
 }
 
 impl DamageSegment {
-    fn rasterize(&self, effects: &mut [f32], width: u32, height: u32) {
-        let padding = self.softness * 2.0 + self.deformation;
+    fn rasterize(&self, effects: &mut [f32], width: u32, height: u32, blur: BlurParameters) {
+        let sharp_softness = (self.half_width.min(self.half_height) * 0.025).max(1.0);
+        let softness = lerp(
+            sharp_softness,
+            self.softness.max(sharp_softness),
+            blur.fraction,
+        );
+        let padding = softness * 2.0 + self.deformation;
         let extent_x = self.cos_angle.abs() * self.half_width
             + self.sin_angle.abs() * self.half_height
             + padding;
@@ -670,7 +778,7 @@ impl DamageSegment {
                 let signed_distance =
                     rounded_box_distance(local_x, local_y, self.half_width, self.half_height)
                         + boundary_offset;
-                let coverage = soft_rectangle_coverage(signed_distance, self.softness);
+                let coverage = soft_rectangle_coverage(signed_distance, softness);
                 if coverage == 0.0 {
                     continue;
                 }
@@ -782,6 +890,11 @@ fn rounded_box_distance(x: f32, y: f32, half_width: f32, half_height: f32) -> f3
 
 fn soft_rectangle_coverage(signed_distance: f32, softness: f32) -> f32 {
     let progress = ((softness - signed_distance) / (softness * 2.0)).clamp(0.0, 1.0);
+    progress * progress * (3.0 - 2.0 * progress)
+}
+
+fn smoothstep(start: f32, end: f32, value: f32) -> f32 {
+    let progress = ((value - start) / (end - start)).clamp(0.0, 1.0);
     progress * progress * (3.0 - 2.0 * progress)
 }
 

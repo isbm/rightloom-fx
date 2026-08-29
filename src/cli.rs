@@ -42,6 +42,7 @@ pub(crate) struct BokehArgs {
     pub(crate) render: RenderSettings,
     pub(crate) types: Vec<BokehType>,
     pub(crate) placements: Vec<BokehPlacement>,
+    pub(crate) blur: u8,
     pub(crate) size: u8,
     pub(crate) uniform: u8,
 }
@@ -94,6 +95,9 @@ impl Cli {
                     .copied()
                     .collect(),
                 placements: bokeh_placements(arguments),
+                blur: *arguments
+                    .get_one("blur")
+                    .expect("clap supplies the bokeh blur default"),
                 size: *arguments
                     .get_one("size")
                     .expect("clap supplies the bokeh size default"),
@@ -264,6 +268,15 @@ fn bokeh_command(styles: styling::Styles) -> ClapCommand {
                     .help("Placement bias. Use center/c, left/l, right/r, top/t, or bottom/b; comma-separate or repeat.")
                     .action(ArgAction::Append)
                     .value_parser(validate_bokeh_places),
+            )
+            .arg(
+                Arg::new("blur")
+                    .short('b')
+                    .long("blur")
+                    .value_name("PERCENT")
+                    .help("Bokeh edge softness, 0-100.\n0 = sharpest optical edge, 100 = maximum diffusion.")
+                    .default_value("100")
+                    .value_parser(parse_blur),
             )
             .arg(
                 Arg::new("size")

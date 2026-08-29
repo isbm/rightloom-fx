@@ -158,6 +158,7 @@ fn bokeh_subcommand_and_each_type_parse() {
         };
 
         assert_eq!(args.types, [expected]);
+        assert_eq!(args.blur, 100);
         assert_eq!(args.size, 50);
         assert_eq!(args.uniform, 50);
     }
@@ -254,6 +255,24 @@ fn bokeh_size_and_uniform_are_limited_to_percentages() {
 
     assert!(parse_size("101").is_err());
     assert!(parse_uniform("101").is_err());
+}
+
+#[test]
+fn bokeh_blur_defaults_to_100_and_accepts_percentage_endpoints() {
+    for value in ["0", "100"] {
+        let cli =
+            parse_bokeh(&["-t", "edge", "-b", value]).expect("in-range bokeh blur should parse");
+        let blur = match cli.command {
+            Command::Bokeh(args) => args.blur,
+            Command::Scratches(_) | Command::Stain(_) => {
+                panic!("bokeh command should parse as bokeh")
+            }
+        };
+
+        assert_eq!(blur, value.parse::<u8>().expect("test blur should parse"));
+    }
+
+    assert!(parse_bokeh(&["-t", "edge", "-b", "101"]).is_err());
 }
 
 #[test]
@@ -467,6 +486,20 @@ fn stain_help_documents_blur_lightness_and_contrast() {
     assert!(help.contains("[default: 50]"));
     assert!(help.contains("--alpha"));
     assert!(help.contains("--background <RRGGBB>"));
+}
+
+#[test]
+fn bokeh_help_documents_its_blur_control() {
+    let command = cli();
+    let error = command
+        .try_get_matches_from(["rightloom-fx", "bokeh", "--help"])
+        .expect_err("help should short-circuit parsing");
+    let help = error.to_string();
+
+    assert!(help.contains("-b, --blur <PERCENT>"));
+    assert!(help.contains("Bokeh edge softness, 0-100."));
+    assert!(help.contains("0 = sharpest optical edge, 100 = maximum diffusion."));
+    assert!(help.contains("[default: 100]"));
 }
 
 #[test]
