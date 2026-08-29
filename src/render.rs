@@ -253,6 +253,11 @@ pub enum RenderError {
     NoBokehTypes,
     InvalidBokehEdgePlacement,
     InvalidBokehDamagePlacement,
+    TwinkleCoverageUnreachable {
+        target: f32,
+        coverage: f32,
+        count: usize,
+    },
     CreateOutput {
         path: PathBuf,
         source: io::Error,
@@ -326,6 +331,18 @@ impl fmt::Display for RenderError {
                     "center placement is not available for damage bokeh"
                 )
             }
+            Self::TwinkleCoverageUnreachable {
+                target,
+                coverage,
+                count,
+            } => {
+                write!(
+                    formatter,
+                    "twinkle density target {:.1}% could not be reached after {count} primitives; measured {:.1}% body coverage",
+                    target * 100.0,
+                    coverage * 100.0
+                )
+            }
             Self::CreateOutput { path, source } => {
                 write!(
                     formatter,
@@ -379,10 +396,26 @@ impl Error for RenderError {
 pub(crate) fn write_images<F>(
     settings: &RenderSettings,
     prefix: &str,
-    render: F,
+    mut render: F,
 ) -> Result<(), RenderError>
 where
     F: FnMut() -> RgbaImage,
+{
+    write_images_with_progress(
+        settings,
+        prefix,
+        || Ok(render()),
+        |message| println!("{message}"),
+    )
+}
+
+pub(crate) fn write_images_fallible<F>(
+    settings: &RenderSettings,
+    prefix: &str,
+    render: F,
+) -> Result<(), RenderError>
+where
+    F: FnMut() -> Result<RgbaImage, RenderError>,
 {
     write_images_with_progress(settings, prefix, render, |message| println!("{message}"))
 }
@@ -394,7 +427,7 @@ fn write_images_with_progress<F, P>(
     mut progress: P,
 ) -> Result<(), RenderError>
 where
-    F: FnMut() -> RgbaImage,
+    F: FnMut() -> Result<RgbaImage, RenderError>,
     P: FnMut(&str),
 {
     settings.validate()?;
@@ -422,7 +455,14 @@ where
         let filename = output_filename(prefix, sequence);
         progress(&format!("generating {filename} ..."));
 
-        let mut image = render();
+        let mut image = match render() {
+            Ok(image) => image,
+            Err(error) => {
+                drop(file);
+                let _ = fs::remove_file(&path);
+                return Err(error);
+            }
+        };
         settings.export_policy.apply_to(&mut image);
         write_reserved_image(&path, file, &image)?;
 

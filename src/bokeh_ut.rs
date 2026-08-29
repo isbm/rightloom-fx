@@ -6,7 +6,7 @@ use std::{
     sync::atomic::{AtomicUsize, Ordering},
 };
 
-use rand::{SeedableRng, rngs::StdRng};
+use rand::{Rng, SeedableRng, rngs::StdRng};
 
 use super::*;
 use crate::render::{ExportPolicy, Resolution, RgbColor};
@@ -73,6 +73,34 @@ fn assert_close(actual: f32, expected: f32) {
 
 fn effect_at(effects: &[f32], width: u32, x: u32, y: u32) -> f32 {
     effects[y as usize * width as usize + x as usize]
+}
+
+fn measured_twinkle_coverage(twinkles: &[Twinkle], width: u32, height: u32, deform: u8) -> f32 {
+    let mut occupancy = TwinkleOccupancy::new(width, height);
+    for twinkle in twinkles {
+        occupancy.mark_twinkle(twinkle, deform);
+    }
+    occupancy.coverage()
+}
+
+fn coverage_settings(density: u8, size: u8, uniform: u8) -> BokehSettings {
+    let mut settings = settings(&[BokehType::Twinkle], &[], density, size, uniform);
+    settings.render.resolution =
+        Resolution::new(480, 320).expect("test resolution should be valid");
+    settings.blur = 30;
+    settings.lightness = 60;
+    settings.deform = 0;
+    settings
+}
+
+fn manual_density_settings(density: u8) -> BokehSettings {
+    let mut settings = settings(&[BokehType::Twinkle], &[], density, 40, 60);
+    settings.render.resolution =
+        Resolution::new(1_000, 667).expect("test resolution should be valid");
+    settings.blur = 30;
+    settings.lightness = 60;
+    settings.deform = 0;
+    settings
 }
 
 fn sample_scales(uniform: u8) -> Vec<f32> {
@@ -343,7 +371,7 @@ fn size_100_allows_a_twinkle_near_the_longest_image_side() {
 }
 
 #[test]
-fn size_controls_scale_without_changing_primitive_count() {
+fn size_controls_twinkle_scale() {
     let mut small = settings(&[BokehType::Twinkle], &[], 75, 50, 100);
     small.render.resolution = Resolution::new(1_000, 667).expect("resolution should be valid");
     let mut large = small.clone();
@@ -361,18 +389,17 @@ fn size_controls_scale_without_changing_primitive_count() {
         .map(|twinkle| twinkle.radius_x)
         .fold(0.0, f32::max);
 
-    assert_eq!(small_twinkles.len(), large_twinkles.len());
     assert!(small_maximum < large_maximum);
 }
 
 #[test]
-fn density_controls_counts_without_changing_size_distribution() {
-    assert_eq!(twinkle_count(0), 0);
-    assert!(twinkle_count(10) < twinkle_count(25));
-    assert!(twinkle_count(25) < twinkle_count(50));
-    assert!(twinkle_count(50) < twinkle_count(75));
-    assert!(twinkle_count(75) < twinkle_count(100));
-    assert!(damage_count(50) > twinkle_count(50));
+fn damage_density_count_and_scale_sampling_are_unchanged() {
+    assert_eq!(damage_count(0), 0);
+    assert!(damage_count(10) < damage_count(25));
+    assert!(damage_count(25) < damage_count(50));
+    assert!(damage_count(50) < damage_count(75));
+    assert!(damage_count(75) < damage_count(100));
+    assert_eq!(damage_count(50), 18);
     assert!(edge_count(25) < edge_count(100));
 
     let mut first_rng = StdRng::seed_from_u64(76);
@@ -380,6 +407,270 @@ fn density_controls_counts_without_changing_size_distribution() {
     let mut second_rng = StdRng::seed_from_u64(76);
     let second = sample_object_scale(80, 25, &mut second_rng);
     assert_eq!(first, second);
+}
+
+#[test]
+fn twinkle_count_estimate_uses_the_poisson_coverage_formula() {
+    let canvas_area = 1_000.0 * 667.0;
+    let expected_area = 12_500.0;
+    let targets = [0.05, 0.25, 0.50, 0.75, FULL_TWINKLE_COVERAGE_TARGET];
+    let estimates: Vec<_> = targets
+        .into_iter()
+        .map(|target| estimated_twinkle_count(canvas_area, target, expected_area))
+        .collect();
+
+    assert_eq!(estimated_twinkle_count(canvas_area, 0.0, expected_area), 0);
+    assert!(estimates.windows(2).all(|pair| pair[0] < pair[1]));
+    assert!(
+        estimated_twinkle_count(canvas_area, 0.50, expected_area)
+            > estimated_twinkle_count(canvas_area, 0.50, expected_area * 2.0)
+    );
+    assert_eq!(twinkle_target_coverage(0), 0.0);
+    assert_close(twinkle_target_coverage(100), 0.995);
+    assert!(estimates.last().is_some_and(|count| *count < usize::MAX));
+
+    let expected = (-((1.0 - 0.50_f32).ln()) * canvas_area / expected_area).ceil() as usize;
+    assert_eq!(
+        estimated_twinkle_count(canvas_area, 0.50, expected_area),
+        expected
+    );
+}
+
+#[test]
+fn expected_twinkle_area_uses_size_uniformity_and_no_render_rng() {
+    let small = coverage_settings(50, 10, 60);
+    let large = coverage_settings(50, 90, 60);
+    let mut broad = coverage_settings(50, 100, 1);
+    let mut narrow = broad.clone();
+    narrow.uniform = 100;
+    broad.deform = 100;
+    narrow.deform = 100;
+
+    assert!(
+        expected_twinkle_body_area(&small, 480, 320) < expected_twinkle_body_area(&large, 480, 320)
+    );
+    assert!(
+        expected_twinkle_body_area(&broad, 480, 320)
+            < expected_twinkle_body_area(&narrow, 480, 320)
+    );
+
+    let mut expected_rng = StdRng::seed_from_u64(121);
+    let next_value = expected_rng.random::<u64>();
+    let mut actual_rng = StdRng::seed_from_u64(121);
+    let _ = expected_twinkle_body_area(&large, 480, 320);
+    assert_eq!(actual_rng.random::<u64>(), next_value);
+}
+
+#[test]
+fn occupancy_tracks_the_union_of_overlapping_twinkle_bodies() {
+    let twinkle = geometric_twinkle();
+    let single = measured_twinkle_coverage(&[twinkle], 120, 80, 0);
+    let overlap = measured_twinkle_coverage(&[twinkle, twinkle], 120, 80, 0);
+
+    assert!(single > 0.0);
+    assert_eq!(overlap, single);
+}
+
+#[test]
+fn occupancy_grid_keeps_the_canvas_aspect_ratio() {
+    let occupancy = TwinkleOccupancy::new(1_000, 667);
+
+    assert_eq!((occupancy.grid_width, occupancy.grid_height), (192, 128));
+}
+
+#[test]
+fn occupancy_uses_the_exact_circular_body_when_deform_is_zero() {
+    let twinkle = geometric_twinkle();
+
+    assert!(twinkle.contains_body(twinkle.center_x + 12.0, twinkle.center_y + 16.0, 0));
+    assert!(!twinkle.contains_body(twinkle.center_x + 12.1, twinkle.center_y + 16.0, 0));
+    assert!(
+        measured_twinkle_coverage(&[twinkle], 120, 80, 100)
+            > measured_twinkle_coverage(&[twinkle], 120, 80, 0)
+    );
+}
+
+#[test]
+fn blur_and_lightness_do_not_change_twinkle_body_occupancy() {
+    let sharp = coverage_settings(50, 20, 100);
+    let mut soft = sharp.clone();
+    soft.blur = 100;
+    let mut bright = sharp.clone();
+    bright.lightness = 100;
+    let width = sharp.render.resolution.width();
+    let height = sharp.render.resolution.height();
+
+    let mut sharp_rng = StdRng::seed_from_u64(122);
+    let sharp_generation = generate_twinkles_with_coverage(&sharp, width, height, &mut sharp_rng)
+        .expect("sharp twinkles should reach their target");
+    let mut soft_rng = StdRng::seed_from_u64(122);
+    let soft_generation = generate_twinkles_with_coverage(&soft, width, height, &mut soft_rng)
+        .expect("soft twinkles should reach their target");
+    let mut bright_rng = StdRng::seed_from_u64(122);
+    let bright_generation =
+        generate_twinkles_with_coverage(&bright, width, height, &mut bright_rng)
+            .expect("bright twinkles should reach their target");
+
+    assert_eq!(sharp_generation.twinkles, soft_generation.twinkles);
+    assert_eq!(sharp_generation.twinkles, bright_generation.twinkles);
+    assert_eq!(
+        sharp_generation.initial_count,
+        soft_generation.initial_count
+    );
+    assert_eq!(
+        sharp_generation.initial_count,
+        bright_generation.initial_count
+    );
+    assert_eq!(sharp_generation.coverage, soft_generation.coverage);
+    assert_eq!(sharp_generation.coverage, bright_generation.coverage);
+}
+
+#[test]
+fn twinkle_occupancy_and_primitives_are_seeded_deterministic() {
+    let settings = coverage_settings(75, 20, 100);
+    let width = settings.render.resolution.width();
+    let height = settings.render.resolution.height();
+    let mut first_rng = StdRng::seed_from_u64(123);
+    let first = generate_twinkles_with_coverage(&settings, width, height, &mut first_rng)
+        .expect("first generation should reach its target");
+    let mut second_rng = StdRng::seed_from_u64(123);
+    let second = generate_twinkles_with_coverage(&settings, width, height, &mut second_rng)
+        .expect("second generation should reach its target");
+
+    assert_eq!(first.twinkles, second.twinkles);
+    assert_eq!(first.initial_count, second.initial_count);
+    assert_eq!(first.coverage, second.coverage);
+}
+
+#[test]
+fn twinkle_density_reaches_monotonic_body_coverage_targets() {
+    let mut coverages = Vec::new();
+
+    for density in [5, 25, 50, 75, 100] {
+        let settings = manual_density_settings(density);
+        let width = settings.render.resolution.width();
+        let height = settings.render.resolution.height();
+        let mut rng = StdRng::seed_from_u64(128);
+        let generation = generate_twinkles_with_coverage(&settings, width, height, &mut rng)
+            .expect("twinkles should reach their target");
+        let measured =
+            measured_twinkle_coverage(&generation.twinkles, width, height, settings.deform);
+        let target = twinkle_target_coverage(density);
+
+        assert_eq!(measured, generation.coverage);
+        assert!(measured >= target, "density {density} measured {measured}");
+        if density < 100 {
+            assert!(
+                measured <= target + TWINKLE_COVERAGE_TOLERANCE,
+                "density {density} overshot: {measured}"
+            );
+        } else {
+            assert!(measured >= 0.995);
+        }
+        coverages.push(measured);
+    }
+
+    assert!(coverages.windows(2).all(|pair| pair[0] <= pair[1]));
+}
+
+#[test]
+fn density_is_independent_of_twinkle_size() {
+    let small = coverage_settings(75, 10, 100);
+    let large = coverage_settings(75, 90, 60);
+    let width = small.render.resolution.width();
+    let height = small.render.resolution.height();
+    let mut small_rng = StdRng::seed_from_u64(125);
+    let small_generation = generate_twinkles_with_coverage(&small, width, height, &mut small_rng)
+        .expect("small twinkles should reach their target");
+    let mut large_rng = StdRng::seed_from_u64(125);
+    let large_generation = generate_twinkles_with_coverage(&large, width, height, &mut large_rng)
+        .expect("large twinkles should reach their target");
+
+    assert!(small_generation.twinkles.len() > large_generation.twinkles.len());
+    for (label, generation) in [("small", &small_generation), ("large", &large_generation)] {
+        assert!(generation.coverage >= 0.75, "{label} coverage was too low");
+        assert!(generation.coverage <= 0.77, "{label} coverage was too high");
+    }
+}
+
+#[test]
+fn center_placement_remains_a_bias_while_full_density_reaches_the_canvas() {
+    let mut settings = coverage_settings(100, 10, 100);
+    settings.placements = vec![BokehPlacement::Center];
+    let width = settings.render.resolution.width();
+    let height = settings.render.resolution.height();
+    let mut rng = StdRng::seed_from_u64(126);
+    let generation = generate_twinkles_with_coverage(&settings, width, height, &mut rng)
+        .expect("center-biased twinkles should reach their target");
+
+    assert!(generation.coverage >= 0.995);
+}
+
+#[test]
+fn twinkle_placement_is_biased_without_becoming_a_clipping_zone() {
+    let mut rng = StdRng::seed_from_u64(127);
+    let positions: Vec<_> = (0..512)
+        .map(|_| twinkle_placement_position(Some(BokehPlacement::Left), 1_000, 667, &mut rng))
+        .collect();
+    let mean_x = positions.iter().map(|position| position.0).sum::<f32>() / positions.len() as f32;
+
+    assert!(mean_x < 350.0);
+    assert!(positions.iter().any(|position| position.0 > 800.0));
+}
+
+#[test]
+fn zero_density_generates_no_twinkles() {
+    let settings = coverage_settings(0, 40, 60);
+    let mut rng = StdRng::seed_from_u64(129);
+    let generation = generate_twinkles_with_coverage(&settings, 480, 320, &mut rng)
+        .expect("zero density should be valid");
+
+    assert!(generation.twinkles.is_empty());
+    assert_eq!(generation.initial_count, 0);
+    assert_eq!(generation.coverage, 0.0);
+}
+
+#[test]
+#[ignore = "writes seeded twinkle-density diagnostics under .tmp"]
+fn writes_seeded_twinkle_density_diagnostics() {
+    const SEED: u64 = 128;
+    const WIDTH: u32 = 1_000;
+    const HEIGHT: u32 = 667;
+
+    for density in [5, 25, 50, 75, 100] {
+        let mut settings = manual_density_settings(density);
+        settings.render.outdir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join(".tmp")
+            .join(format!("density-seeded-{density:02}"));
+
+        let mut measurement_rng = StdRng::seed_from_u64(SEED);
+        let generation =
+            generate_twinkles_with_coverage(&settings, WIDTH, HEIGHT, &mut measurement_rng)
+                .expect("density diagnostic should reach its target");
+        println!(
+            "density {density:3}: initial {:4}, final {:4}, coverage {:.3}%",
+            generation.initial_count,
+            generation.twinkles.len(),
+            generation.coverage * 100.0
+        );
+
+        let mut output_rng = StdRng::seed_from_u64(SEED);
+        generate_images_with_rng(&settings, &mut output_rng)
+            .expect("density diagnostic should write successfully");
+    }
+
+    for size in [10, 90] {
+        let settings = settings(&[BokehType::Twinkle], &[], 75, size, 60);
+        let mut rng = StdRng::seed_from_u64(SEED);
+        let generation = generate_twinkles_with_coverage(&settings, WIDTH, HEIGHT, &mut rng)
+            .expect("size diagnostic should reach its target");
+        println!(
+            "size {size:2}, density 75: initial {:4}, final {:4}, coverage {:.3}%",
+            generation.initial_count,
+            generation.twinkles.len(),
+            generation.coverage * 100.0
+        );
+    }
 }
 
 #[test]
@@ -529,7 +820,7 @@ fn deformation_is_bounded_and_keeps_every_effective_radius_positive() {
 }
 
 #[test]
-fn deform_preserves_seeded_primitives_and_unrelated_effect_rng_sequence() {
+fn deform_uses_its_body_geometry_without_affecting_other_effect_generators() {
     let mut circular = settings(
         &[BokehType::Twinkle, BokehType::Edge, BokehType::Damage],
         &[BokehPlacement::Left],
@@ -543,17 +834,24 @@ fn deform_preserves_seeded_primitives_and_unrelated_effect_rng_sequence() {
     organic.deform = 100;
 
     let mut circular_rng = StdRng::seed_from_u64(108);
-    let circular_twinkles = generate_twinkles(&circular, 1_000, 667, &mut circular_rng);
+    let circular_twinkles =
+        generate_twinkles_with_coverage(&circular, 1_000, 667, &mut circular_rng)
+            .expect("circular twinkles should reach their target");
     let mut organic_rng = StdRng::seed_from_u64(108);
-    let organic_twinkles = generate_twinkles(&organic, 1_000, 667, &mut organic_rng);
-    assert_eq!(circular_twinkles.len(), organic_twinkles.len());
-    assert_eq!(circular_twinkles, organic_twinkles);
+    let organic_twinkles = generate_twinkles_with_coverage(&organic, 1_000, 667, &mut organic_rng)
+        .expect("organic twinkles should reach their target");
+    assert!(circular_twinkles.coverage >= twinkle_target_coverage(60));
+    assert!(organic_twinkles.coverage >= twinkle_target_coverage(60));
 
-    let circular_edges = generate_edge_exposures(&circular, 1_000, 667, &mut circular_rng);
-    let organic_edges = generate_edge_exposures(&organic, 1_000, 667, &mut organic_rng);
+    let mut circular_edge_rng = StdRng::seed_from_u64(108);
+    let mut organic_edge_rng = StdRng::seed_from_u64(108);
+    let circular_edges = generate_edge_exposures(&circular, 1_000, 667, &mut circular_edge_rng);
+    let organic_edges = generate_edge_exposures(&organic, 1_000, 667, &mut organic_edge_rng);
     assert_eq!(circular_edges, organic_edges);
-    let circular_damage = generate_damage_segments(&circular, 1_000, 667, &mut circular_rng);
-    let organic_damage = generate_damage_segments(&organic, 1_000, 667, &mut organic_rng);
+    let mut circular_damage_rng = StdRng::seed_from_u64(109);
+    let mut organic_damage_rng = StdRng::seed_from_u64(109);
+    let circular_damage = generate_damage_segments(&circular, 1_000, 667, &mut circular_damage_rng);
+    let organic_damage = generate_damage_segments(&organic, 1_000, 667, &mut organic_damage_rng);
     assert_eq!(circular_damage, organic_damage);
 
     let mut circular_rng = StdRng::seed_from_u64(109);

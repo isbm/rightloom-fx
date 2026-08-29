@@ -3,11 +3,11 @@ use std::str::FromStr;
 use image::{Rgba, RgbaImage};
 use rand::Rng;
 
-use crate::render::{RenderError, RenderSettings, write_images};
+use crate::render::{RenderError, RenderSettings, write_images_fallible};
 
 const TAIL_THRESHOLD: f32 = 1e-4;
 const EDGE_FALLOFF: f32 = 2.7;
-const TWINKLE_COUNT_ANCHORS: [(u8, usize); 7] = [
+const DAMAGE_COUNT_ANCHORS: [(u8, usize); 7] = [
     (0, 0),
     (1, 1),
     (10, 2),
@@ -16,6 +16,18 @@ const TWINKLE_COUNT_ANCHORS: [(u8, usize); 7] = [
     (75, 9),
     (100, 14),
 ];
+const FULL_TWINKLE_COVERAGE_TARGET: f32 = 0.995;
+const EXPECTED_TWINKLE_AREA_SAMPLES: usize = 64;
+const OCCUPANCY_GRID_LONGEST_SIDE: u32 = 192;
+const TWINKLE_COVERAGE_TOLERANCE: f32 = 0.02;
+const MAX_TWINKLE_CANDIDATE_ATTEMPTS: usize = 1_024;
+const MIN_TWINKLE_SAFETY_CAP: usize = 4_096;
+const MAX_TWINKLE_SAFETY_CAP: usize = 1_000_000;
+const TWINKLE_WIDE_PLACEMENT_CHANCE: f64 = 0.25;
+const TWINKLE_ASPECT_MIN: f32 = 0.75;
+const TWINKLE_ASPECT_MAX: f32 = 1.25;
+const TWINKLE_DEFORMATION_MIN: f32 = 0.015;
+const TWINKLE_DEFORMATION_MAX: f32 = 0.065;
 const SUPPORTED_BOKEH_TYPES: [&str; 3] = ["twinkle", "edge", "damage"];
 const SUPPORTED_BOKEH_PLACEMENTS: [&str; 5] = ["center", "left", "right", "top", "bottom"];
 
@@ -175,24 +187,42 @@ fn generate_images_with_rng<R: Rng + ?Sized>(
     rng: &mut R,
 ) -> Result<(), RenderError> {
     settings.validate()?;
-    write_images(&settings.render, "bokeh", || render_image(settings, rng))
+    write_images_fallible(&settings.render, "bokeh", || {
+        render_image_result(settings, rng)
+    })
 }
 
+#[cfg(test)]
 fn render_image<R: Rng + ?Sized>(settings: &BokehSettings, rng: &mut R) -> RgbaImage {
+    render_image_result(settings, rng)
+        .expect("valid bokeh settings should reach their twinkle coverage target")
+}
+
+fn render_image_result<R: Rng + ?Sized>(
+    settings: &BokehSettings,
+    rng: &mut R,
+) -> Result<RgbaImage, RenderError> {
     let width = settings.render.resolution.width();
     let height = settings.render.resolution.height();
     let blur = BlurParameters::new(settings.blur, width, height);
     let mut effects = vec![0.0; width as usize * height as usize];
 
     if settings.render.density == 0 {
-        return scalar_effects_to_image(&effects, width, height, settings.lightness);
+        return Ok(scalar_effects_to_image(
+            &effects,
+            width,
+            height,
+            settings.lightness,
+        ));
     }
 
     for bokeh_type in &settings.types {
         let effect_settings = settings_for_type(settings, *bokeh_type);
         match bokeh_type {
             BokehType::Twinkle => {
-                for twinkle in generate_twinkles(&effect_settings, width, height, rng) {
+                let generation =
+                    generate_twinkles_with_coverage(&effect_settings, width, height, rng)?;
+                for twinkle in generation.twinkles {
                     twinkle.rasterize(&mut effects, width, height, blur, effect_settings.deform);
                 }
             }
@@ -209,7 +239,12 @@ fn render_image<R: Rng + ?Sized>(settings: &BokehSettings, rng: &mut R) -> RgbaI
         }
     }
 
-    scalar_effects_to_image(&effects, width, height, settings.lightness)
+    Ok(scalar_effects_to_image(
+        &effects,
+        width,
+        height,
+        settings.lightness,
+    ))
 }
 
 fn accumulate_scalar_effect(accumulated: f32, contribution: f32) -> f32 {
@@ -273,12 +308,8 @@ fn lerp(start: f32, end: f32, progress: f32) -> f32 {
     start + (end - start) * progress
 }
 
-fn twinkle_count(density: u8) -> usize {
-    interpolated_count(density, &TWINKLE_COUNT_ANCHORS)
-}
-
 fn damage_count(density: u8) -> usize {
-    twinkle_count(density) * 3
+    interpolated_count(density, &DAMAGE_COUNT_ANCHORS) * 3
 }
 
 fn edge_count(density: u8) -> usize {
@@ -300,6 +331,81 @@ fn interpolated_count(density: u8, anchors: &[(u8, usize)]) -> usize {
     let progress = (f32::from(density) - f32::from(start.0)) / f32::from(end.0 - start.0);
 
     (start.1 as f32 + (end.1 as f32 - start.1 as f32) * progress).round() as usize
+}
+
+fn twinkle_target_coverage(density: u8) -> f32 {
+    match density {
+        0 => 0.0,
+        100 => FULL_TWINKLE_COVERAGE_TARGET,
+        _ => f32::from(density) / 100.0,
+    }
+}
+
+fn estimated_twinkle_count(canvas_area: f32, target: f32, expected_area: f32) -> usize {
+    if target <= 0.0 {
+        return 0;
+    }
+
+    debug_assert!(target < 1.0);
+    (-((1.0 - target).ln()) * canvas_area / expected_area)
+        .ceil()
+        .max(1.0) as usize
+}
+
+fn correction_twinkle_count(
+    canvas_area: f32,
+    target: f32,
+    coverage: f32,
+    expected_area: f32,
+) -> usize {
+    let remaining_target = (target - coverage) / (1.0 - coverage);
+    estimated_twinkle_count(canvas_area, remaining_target, expected_area).max(1)
+}
+
+fn twinkle_coverage_ceiling(target: f32) -> f32 {
+    if target >= FULL_TWINKLE_COVERAGE_TARGET {
+        1.0
+    } else {
+        (target + TWINKLE_COVERAGE_TOLERANCE).min(1.0)
+    }
+}
+
+fn twinkle_safety_cap(initial_count: usize) -> usize {
+    initial_count
+        .saturating_mul(8)
+        .clamp(MIN_TWINKLE_SAFETY_CAP, MAX_TWINKLE_SAFETY_CAP)
+}
+
+fn expected_twinkle_body_area(settings: &BokehSettings, width: u32, height: u32) -> f32 {
+    let longest_side = width.max(height) as f32;
+    let mean_base_area = (0..EXPECTED_TWINKLE_AREA_SAMPLES)
+        .map(|index| {
+            let quantile = (index as f32 + 0.5) / EXPECTED_TWINKLE_AREA_SAMPLES as f32;
+            let scale = expected_object_scale_at(settings.size, settings.uniform, quantile);
+            let radius = (longest_side * scale * 0.5).max(0.5);
+            std::f32::consts::PI * radius * radius
+        })
+        .sum::<f32>()
+        / EXPECTED_TWINKLE_AREA_SAMPLES as f32;
+    let deform_amount = f32::from(settings.deform) / 100.0;
+    let expected_deformation_squared = (TWINKLE_DEFORMATION_MIN.powi(2)
+        + TWINKLE_DEFORMATION_MIN * TWINKLE_DEFORMATION_MAX
+        + TWINKLE_DEFORMATION_MAX.powi(2))
+        / 3.0;
+
+    // The generated aspect ratio has a mean of one; wobble adds its mean squared radial area.
+    mean_base_area * (1.0 + 0.5 * deform_amount.powi(2) * expected_deformation_squared)
+}
+
+fn expected_object_scale_at(size: u8, uniform: u8, quantile: f32) -> f32 {
+    let maximum = maximum_scale(size);
+    let quantile = quantile.clamp(0.0, 1.0);
+    if uniform == 100 {
+        return maximum * lerp(0.97, 1.03, quantile);
+    }
+
+    let minimum = maximum * minimum_size_fraction(uniform);
+    minimum * (maximum / minimum).powf(quantile)
 }
 
 fn maximum_scale(size: u8) -> f32 {
@@ -422,16 +528,9 @@ impl Twinkle {
             for x in start_x..=end_x {
                 let dx = x as f32 + 0.5 - self.center_x;
                 let dy = y as f32 + 0.5 - self.center_y;
-                let local_x = dx * self.cos_angle + dy * self.sin_angle;
-                let local_y = -dx * self.sin_angle + dy * self.cos_angle;
-                let normalized_distance = if deform == 0 {
-                    (dx * dx + dy * dy).sqrt() / self.radius_x
-                } else {
-                    let angle = local_y.atan2(local_x);
-                    let radial_adjustment = self.radial_adjustment(angle, deform);
-                    let d2 = (local_x / self.radius_x).powi(2) + (local_y / radius_y).powi(2);
-                    d2.sqrt() / radial_adjustment
-                };
+                let (local_x, local_y) = self.local_coordinates(dx, dy);
+                let normalized_distance =
+                    self.normalized_body_distance(dx, dy, local_x, local_y, deform);
                 let coverage =
                     soft_rectangle_coverage((normalized_distance - 1.0) * nominal_radius, softness);
                 let rim = smoothstep(0.52, 0.90, normalized_distance);
@@ -446,6 +545,54 @@ impl Twinkle {
                 }
             }
         }
+    }
+
+    fn local_coordinates(&self, dx: f32, dy: f32) -> (f32, f32) {
+        (
+            dx * self.cos_angle + dy * self.sin_angle,
+            -dx * self.sin_angle + dy * self.cos_angle,
+        )
+    }
+
+    fn normalized_body_distance(
+        &self,
+        dx: f32,
+        dy: f32,
+        local_x: f32,
+        local_y: f32,
+        deform: u8,
+    ) -> f32 {
+        if deform == 0 {
+            return (dx * dx + dy * dy).sqrt() / self.radius_x;
+        }
+
+        let angle = local_y.atan2(local_x);
+        let radial_adjustment = self.radial_adjustment(angle, deform);
+        let radius_y = self.effective_radius_y(deform);
+        let d2 = (local_x / self.radius_x).powi(2) + (local_y / radius_y).powi(2);
+        d2.sqrt() / radial_adjustment
+    }
+
+    fn contains_body(&self, x: f32, y: f32, deform: u8) -> bool {
+        let dx = x - self.center_x;
+        let dy = y - self.center_y;
+        let (local_x, local_y) = self.local_coordinates(dx, dy);
+        self.normalized_body_distance(dx, dy, local_x, local_y, deform) <= 1.0
+    }
+
+    fn body_extents(&self, deform: u8) -> (f32, f32) {
+        if deform == 0 {
+            return (self.radius_x, self.radius_x);
+        }
+
+        let radius_y = self.effective_radius_y(deform);
+        let maximum_radial_adjustment = 1.0 + f32::from(deform) / 100.0 * self.deformation;
+        (
+            (self.cos_angle.abs() * self.radius_x + self.sin_angle.abs() * radius_y)
+                * maximum_radial_adjustment,
+            (self.sin_angle.abs() * self.radius_x + self.cos_angle.abs() * radius_y)
+                * maximum_radial_adjustment,
+        )
     }
 
     fn effective_radius_y(&self, deform: u8) -> f32 {
@@ -478,45 +625,358 @@ impl Twinkle {
     }
 }
 
+#[derive(Debug)]
+struct TwinkleGeneration {
+    twinkles: Vec<Twinkle>,
+    #[cfg(test)]
+    initial_count: usize,
+    #[cfg(test)]
+    coverage: f32,
+}
+
+#[derive(Debug)]
+struct TwinkleOccupancy {
+    grid_width: u32,
+    grid_height: u32,
+    canvas_width: u32,
+    canvas_height: u32,
+    occupied: Vec<bool>,
+    occupied_count: usize,
+}
+
+impl TwinkleOccupancy {
+    fn new(canvas_width: u32, canvas_height: u32) -> Self {
+        let longest_side = canvas_width.max(canvas_height);
+        let grid_width = occupancy_grid_dimension(canvas_width, longest_side);
+        let grid_height = occupancy_grid_dimension(canvas_height, longest_side);
+
+        Self {
+            grid_width,
+            grid_height,
+            canvas_width,
+            canvas_height,
+            occupied: vec![false; grid_width as usize * grid_height as usize],
+            occupied_count: 0,
+        }
+    }
+
+    fn coverage(&self) -> f32 {
+        self.occupied_count as f32 / self.occupied.len() as f32
+    }
+
+    fn mark_twinkle(&mut self, twinkle: &Twinkle, deform: u8) {
+        let (extent_x, extent_y) = twinkle.body_extents(deform);
+        let Some((start_x, end_x, start_y, end_y)) = self.bounds(
+            twinkle.center_x - extent_x,
+            twinkle.center_x + extent_x,
+            twinkle.center_y - extent_y,
+            twinkle.center_y + extent_y,
+        ) else {
+            return;
+        };
+
+        for y in start_y..=end_y {
+            let sample_y = (y as f32 + 0.5) * self.canvas_height as f32 / self.grid_height as f32;
+            for x in start_x..=end_x {
+                let index = y as usize * self.grid_width as usize + x as usize;
+                if self.occupied[index] {
+                    continue;
+                }
+
+                let sample_x = (x as f32 + 0.5) * self.canvas_width as f32 / self.grid_width as f32;
+                if twinkle.contains_body(sample_x, sample_y, deform) {
+                    self.occupied[index] = true;
+                    self.occupied_count += 1;
+                }
+            }
+        }
+    }
+
+    fn new_cells_for_twinkle(&self, twinkle: &Twinkle, deform: u8) -> usize {
+        let (extent_x, extent_y) = twinkle.body_extents(deform);
+        let Some((start_x, end_x, start_y, end_y)) = self.bounds(
+            twinkle.center_x - extent_x,
+            twinkle.center_x + extent_x,
+            twinkle.center_y - extent_y,
+            twinkle.center_y + extent_y,
+        ) else {
+            return 0;
+        };
+
+        let mut new_cells = 0;
+        for y in start_y..=end_y {
+            let sample_y = (y as f32 + 0.5) * self.canvas_height as f32 / self.grid_height as f32;
+            for x in start_x..=end_x {
+                let index = y as usize * self.grid_width as usize + x as usize;
+                if self.occupied[index] {
+                    continue;
+                }
+
+                let sample_x = (x as f32 + 0.5) * self.canvas_width as f32 / self.grid_width as f32;
+                if twinkle.contains_body(sample_x, sample_y, deform) {
+                    new_cells += 1;
+                }
+            }
+        }
+
+        new_cells
+    }
+
+    fn coverage_with_added_cells(&self, additional_cells: usize) -> f32 {
+        (self.occupied_count + additional_cells) as f32 / self.occupied.len() as f32
+    }
+
+    fn bounds(
+        &self,
+        min_x: f32,
+        max_x: f32,
+        min_y: f32,
+        max_y: f32,
+    ) -> Option<(u32, u32, u32, u32)> {
+        let (start_x, end_x) =
+            occupancy_axis_bounds(self.grid_width, self.canvas_width, min_x, max_x)?;
+        let (start_y, end_y) =
+            occupancy_axis_bounds(self.grid_height, self.canvas_height, min_y, max_y)?;
+        Some((start_x, end_x, start_y, end_y))
+    }
+}
+
+fn occupancy_grid_dimension(length: u32, longest_side: u32) -> u32 {
+    ((u64::from(length) * u64::from(OCCUPANCY_GRID_LONGEST_SIDE) + u64::from(longest_side) / 2)
+        / u64::from(longest_side))
+    .max(1) as u32
+}
+
+fn occupancy_axis_bounds(
+    cell_count: u32,
+    canvas_length: u32,
+    minimum: f32,
+    maximum: f32,
+) -> Option<(u32, u32)> {
+    if maximum < 0.0 || minimum > canvas_length as f32 {
+        return None;
+    }
+
+    let cell_length = canvas_length as f32 / cell_count as f32;
+    let last_cell = cell_count.saturating_sub(1) as f32;
+    let start = (minimum / cell_length - 0.5).ceil().max(0.0) as u32;
+    let end = (maximum / cell_length - 0.5).floor().min(last_cell) as u32;
+
+    (start <= end).then_some((start, end))
+}
+
+#[cfg(test)]
 fn generate_twinkles<R: Rng + ?Sized>(
     settings: &BokehSettings,
     width: u32,
     height: u32,
     rng: &mut R,
 ) -> Vec<Twinkle> {
-    let count = twinkle_count(settings.render.density);
-    let longest_side = width.max(height) as f32;
-    let mut twinkles = Vec::with_capacity(count);
+    generate_twinkles_with_coverage(settings, width, height, rng)
+        .expect("valid bokeh settings should reach their twinkle coverage target")
+        .twinkles
+}
 
-    for index in 0..count {
-        let scale = sample_object_scale_at(
-            settings.size,
-            settings.uniform,
-            stratified_quantile(index, count, rng),
-            rng,
-        );
-        let radius_x = (longest_side * scale * 0.5).max(0.5);
-        let radius_y = radius_x * rng.random_range(0.75..1.25);
-        let placement = selected_placement(&settings.placements, rng);
-        let (center_x, center_y) = placement_position(placement, width, height, rng);
-        let angle = rng.random_range(0.0..std::f32::consts::TAU);
-
-        twinkles.push(Twinkle {
-            center_x,
-            center_y,
-            radius_x,
-            radius_y,
-            sin_angle: angle.sin(),
-            cos_angle: angle.cos(),
-            intensity: rng.random_range(0.20..0.72),
-            deformation: rng.random_range(0.015..0.065),
-            deformation_frequency: rng.random_range(2..=4) as f32,
-            deformation_phase: rng.random_range(0.0..std::f32::consts::TAU),
-            glow_phase: rng.random_range(0.0..std::f32::consts::TAU),
+fn generate_twinkles_with_coverage<R: Rng + ?Sized>(
+    settings: &BokehSettings,
+    width: u32,
+    height: u32,
+    rng: &mut R,
+) -> Result<TwinkleGeneration, RenderError> {
+    let target = twinkle_target_coverage(settings.render.density);
+    if target == 0.0 {
+        return Ok(TwinkleGeneration {
+            twinkles: Vec::new(),
+            #[cfg(test)]
+            initial_count: 0,
+            #[cfg(test)]
+            coverage: 0.0,
         });
     }
 
-    twinkles
+    let canvas_area = width as f32 * height as f32;
+    let expected_area = expected_twinkle_body_area(settings, width, height);
+    let initial_count = estimated_twinkle_count(canvas_area, target, expected_area);
+    let safety_cap = twinkle_safety_cap(initial_count);
+    if initial_count > safety_cap {
+        return Err(RenderError::TwinkleCoverageUnreachable {
+            target,
+            coverage: 0.0,
+            count: 0,
+        });
+    }
+
+    let mut twinkles = Vec::with_capacity(initial_count);
+    let mut occupancy = TwinkleOccupancy::new(width, height);
+    append_twinkle_batch(
+        settings,
+        width,
+        height,
+        initial_count,
+        rng,
+        &mut twinkles,
+        &mut occupancy,
+        target,
+        false,
+    );
+
+    while occupancy.coverage() < target {
+        if twinkles.len() >= safety_cap {
+            return Err(RenderError::TwinkleCoverageUnreachable {
+                target,
+                coverage: occupancy.coverage(),
+                count: twinkles.len(),
+            });
+        }
+
+        let correction_count =
+            correction_twinkle_count(canvas_area, target, occupancy.coverage(), expected_area)
+                .min(safety_cap - twinkles.len());
+        append_twinkle_batch(
+            settings,
+            width,
+            height,
+            correction_count,
+            rng,
+            &mut twinkles,
+            &mut occupancy,
+            target,
+            true,
+        );
+    }
+
+    Ok(TwinkleGeneration {
+        twinkles,
+        #[cfg(test)]
+        initial_count,
+        #[cfg(test)]
+        coverage: occupancy.coverage(),
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn append_twinkle_batch<R: Rng + ?Sized>(
+    settings: &BokehSettings,
+    width: u32,
+    height: u32,
+    count: usize,
+    rng: &mut R,
+    twinkles: &mut Vec<Twinkle>,
+    occupancy: &mut TwinkleOccupancy,
+    target: f32,
+    stop_at_target: bool,
+) {
+    for index in 0..count {
+        let twinkle = sample_twinkle_within_coverage_ceiling(
+            settings,
+            width,
+            height,
+            index,
+            count,
+            rng,
+            occupancy,
+            twinkle_coverage_ceiling(target),
+        );
+        occupancy.mark_twinkle(&twinkle, settings.deform);
+        twinkles.push(twinkle);
+
+        if stop_at_target && occupancy.coverage() >= target {
+            break;
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn sample_twinkle_within_coverage_ceiling<R: Rng + ?Sized>(
+    settings: &BokehSettings,
+    width: u32,
+    height: u32,
+    index: usize,
+    count: usize,
+    rng: &mut R,
+    occupancy: &TwinkleOccupancy,
+    coverage_ceiling: f32,
+) -> Twinkle {
+    let mut smallest_overshoot = None;
+
+    for _ in 0..MAX_TWINKLE_CANDIDATE_ATTEMPTS {
+        let twinkle = sample_twinkle(settings, width, height, index, count, rng);
+        let added_cells = occupancy.new_cells_for_twinkle(&twinkle, settings.deform);
+        if added_cells == 0 {
+            continue;
+        }
+
+        if occupancy.coverage_with_added_cells(added_cells) <= coverage_ceiling {
+            return twinkle;
+        }
+
+        if smallest_overshoot
+            .as_ref()
+            .is_none_or(|(_, smallest)| added_cells < *smallest)
+        {
+            smallest_overshoot = Some((twinkle, added_cells));
+        }
+    }
+
+    smallest_overshoot
+        .map(|(twinkle, _)| twinkle)
+        .unwrap_or_else(|| sample_twinkle(settings, width, height, index, count, rng))
+}
+
+fn sample_twinkle<R: Rng + ?Sized>(
+    settings: &BokehSettings,
+    width: u32,
+    height: u32,
+    index: usize,
+    count: usize,
+    rng: &mut R,
+) -> Twinkle {
+    let longest_side = width.max(height) as f32;
+    let scale = sample_object_scale_at(
+        settings.size,
+        settings.uniform,
+        stratified_quantile(index, count, rng),
+        rng,
+    );
+    let radius_x = (longest_side * scale * 0.5).max(0.5);
+    let radius_y = radius_x * rng.random_range(TWINKLE_ASPECT_MIN..TWINKLE_ASPECT_MAX);
+    let placement = selected_placement(&settings.placements, rng);
+    let (center_x, center_y) = twinkle_placement_position(placement, width, height, rng);
+    let angle = rng.random_range(0.0..std::f32::consts::TAU);
+
+    Twinkle {
+        center_x,
+        center_y,
+        radius_x,
+        radius_y,
+        sin_angle: angle.sin(),
+        cos_angle: angle.cos(),
+        intensity: rng.random_range(0.20..0.72),
+        deformation: rng.random_range(TWINKLE_DEFORMATION_MIN..TWINKLE_DEFORMATION_MAX),
+        deformation_frequency: rng.random_range(2..=4) as f32,
+        deformation_phase: rng.random_range(0.0..std::f32::consts::TAU),
+        glow_phase: rng.random_range(0.0..std::f32::consts::TAU),
+    }
+}
+
+fn twinkle_placement_position<R: Rng + ?Sized>(
+    placement: Option<BokehPlacement>,
+    width: u32,
+    height: u32,
+    rng: &mut R,
+) -> (f32, f32) {
+    let Some(placement) = placement else {
+        return placement_position(None, width, height, rng);
+    };
+
+    if rng.random_bool(TWINKLE_WIDE_PLACEMENT_CHANCE) {
+        return (
+            rng.random_range(0.0..width as f32),
+            rng.random_range(0.0..height as f32),
+        );
+    }
+
+    placement_position(Some(placement), width, height, rng)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

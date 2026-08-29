@@ -8,8 +8,8 @@ use std::{
 use image::{Rgba, RgbaImage};
 
 use super::{
-    ExportPolicy, RenderSettings, Resolution, RgbColor, next_sequence_start, output_filename,
-    reserve_next_output_file, write_images_with_progress,
+    ExportPolicy, RenderError, RenderSettings, Resolution, RgbColor, next_sequence_start,
+    output_filename, reserve_next_output_file, write_images_with_progress,
 };
 
 static TEMP_DIRECTORY_COUNTER: AtomicUsize = AtomicUsize::new(0);
@@ -236,14 +236,14 @@ fn repeated_writes_append_without_overwriting_existing_outputs() {
     write_images_with_progress(
         &settings,
         "stain",
-        || RgbaImage::from_pixel(1, 1, Rgba([12, 34, 56, 255])),
+        || Ok(RgbaImage::from_pixel(1, 1, Rgba([12, 34, 56, 255]))),
         |_| {},
     )
     .expect("first write should succeed");
     write_images_with_progress(
         &settings,
         "stain",
-        || RgbaImage::from_pixel(1, 1, Rgba([12, 34, 56, 255])),
+        || Ok(RgbaImage::from_pixel(1, 1, Rgba([12, 34, 56, 255]))),
         |_| {},
     )
     .expect("second write should succeed");
@@ -261,4 +261,35 @@ fn repeated_writes_append_without_overwriting_existing_outputs() {
             "appended output {number} should exist"
         );
     }
+}
+
+#[test]
+fn fallible_rendering_removes_its_reserved_output() {
+    let output = TestOutputDir::new();
+    let settings = test_settings(&output, 1);
+
+    let error = write_images_with_progress(
+        &settings,
+        "bokeh",
+        || {
+            Err(RenderError::TwinkleCoverageUnreachable {
+                target: 0.995,
+                coverage: 0.90,
+                count: 4_096,
+            })
+        },
+        |_| {},
+    )
+    .expect_err("unreachable twinkle coverage should fail without writing an image");
+
+    assert!(matches!(
+        error,
+        RenderError::TwinkleCoverageUnreachable { .. }
+    ));
+    assert!(
+        fs::read_dir(output.path())
+            .expect("test output should be readable")
+            .next()
+            .is_none()
+    );
 }
