@@ -251,6 +251,7 @@ pub enum RenderError {
     NoEffects,
     NoBokehTypes,
     InvalidBokehEdgePlacement,
+    InvalidBokehDamagePlacement,
     CreateOutput {
         path: PathBuf,
         source: io::Error,
@@ -313,6 +314,12 @@ impl fmt::Display for RenderError {
                 write!(
                     formatter,
                     "center placement is not available for edge bokeh"
+                )
+            }
+            Self::InvalidBokehDamagePlacement => {
+                write!(
+                    formatter,
+                    "center placement is not available for damage bokeh"
                 )
             }
             Self::CreateOutput { path, source } => {

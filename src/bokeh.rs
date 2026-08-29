@@ -103,6 +103,7 @@ pub struct BokehSettings {
     pub types: Vec<BokehType>,
     pub placements: Vec<BokehPlacement>,
     pub blur: u8,
+    pub lightness: u8,
     pub size: u8,
     pub uniform: u8,
 }
@@ -112,13 +113,22 @@ impl BokehSettings {
         if self.types.is_empty() {
             return Err(RenderError::NoBokehTypes);
         }
-        if self.types.contains(&BokehType::Edge)
-            && self.placements.contains(&BokehPlacement::Center)
-        {
-            return Err(RenderError::InvalidBokehEdgePlacement);
+        for bokeh_type in &self.types {
+            if !self.placements.is_empty()
+                && placements_for_type(*bokeh_type, &self.placements).is_empty()
+            {
+                match bokeh_type {
+                    BokehType::Edge => return Err(RenderError::InvalidBokehEdgePlacement),
+                    BokehType::Damage => return Err(RenderError::InvalidBokehDamagePlacement),
+                    BokehType::Twinkle => unreachable!("twinkle accepts every bokeh placement"),
+                }
+            }
         }
         if self.blur > 100 {
             return Err(RenderError::InvalidBlur(self.blur));
+        }
+        if self.lightness > 100 {
+            return Err(RenderError::InvalidLightness(self.lightness));
         }
         if self.size > 100 {
             return Err(RenderError::InvalidSize(self.size));
@@ -129,6 +139,26 @@ impl BokehSettings {
 
         Ok(())
     }
+}
+
+fn placements_for_type(
+    bokeh_type: BokehType,
+    placements: &[BokehPlacement],
+) -> Vec<BokehPlacement> {
+    match bokeh_type {
+        BokehType::Twinkle => placements.to_vec(),
+        BokehType::Edge | BokehType::Damage => placements
+            .iter()
+            .copied()
+            .filter(|placement| *placement != BokehPlacement::Center)
+            .collect(),
+    }
+}
+
+fn settings_for_type(settings: &BokehSettings, bokeh_type: BokehType) -> BokehSettings {
+    let mut filtered = settings.clone();
+    filtered.placements = placements_for_type(bokeh_type, &settings.placements);
+    filtered
 }
 
 pub fn generate_images(settings: &BokehSettings) -> Result<(), RenderError> {
@@ -151,30 +181,31 @@ fn render_image<R: Rng + ?Sized>(settings: &BokehSettings, rng: &mut R) -> RgbaI
     let mut effects = vec![0.0; width as usize * height as usize];
 
     if settings.render.density == 0 {
-        return scalar_effects_to_image(&effects, width, height);
+        return scalar_effects_to_image(&effects, width, height, settings.lightness);
     }
 
     for bokeh_type in &settings.types {
+        let effect_settings = settings_for_type(settings, *bokeh_type);
         match bokeh_type {
             BokehType::Twinkle => {
-                for twinkle in generate_twinkles(settings, width, height, rng) {
+                for twinkle in generate_twinkles(&effect_settings, width, height, rng) {
                     twinkle.rasterize(&mut effects, width, height, blur);
                 }
             }
             BokehType::Edge => {
-                for exposure in generate_edge_exposures(settings, width, height, rng) {
+                for exposure in generate_edge_exposures(&effect_settings, width, height, rng) {
                     exposure.rasterize(&mut effects, width, height, blur);
                 }
             }
             BokehType::Damage => {
-                for segment in generate_damage_segments(settings, width, height, rng) {
+                for segment in generate_damage_segments(&effect_settings, width, height, rng) {
                     segment.rasterize(&mut effects, width, height, blur);
                 }
             }
         }
     }
 
-    scalar_effects_to_image(&effects, width, height)
+    scalar_effects_to_image(&effects, width, height, settings.lightness)
 }
 
 fn accumulate_scalar_effect(accumulated: f32, contribution: f32) -> f32 {
@@ -186,20 +217,25 @@ fn accumulate_pixel(effects: &mut [f32], width: u32, x: u32, y: u32, contributio
     effects[index] = accumulate_scalar_effect(effects[index], contribution);
 }
 
-fn scalar_effects_to_image(effects: &[f32], width: u32, height: u32) -> RgbaImage {
+fn scalar_effects_to_image(effects: &[f32], width: u32, height: u32, lightness: u8) -> RgbaImage {
     debug_assert_eq!(effects.len(), width as usize * height as usize);
     let mut image = RgbaImage::new(width, height);
+    let luma = bokeh_luma(lightness);
 
     for (effect, pixel) in effects.iter().zip(image.pixels_mut()) {
         *pixel = Rgba([
-            255,
-            255,
-            255,
+            luma,
+            luma,
+            luma,
             (effect.clamp(0.0, 1.0) * 255.0).round() as u8,
         ]);
     }
 
     image
+}
+
+fn bokeh_luma(lightness: u8) -> u8 {
+    ((u16::from(lightness) * 255 + 50) / 100) as u8
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -708,102 +744,206 @@ fn edge_direction<R: Rng + ?Sized>(
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DamageEdge {
+    Left,
+    Right,
+    Top,
+    Bottom,
+}
+
+impl DamageEdge {
+    fn along_length(self, width: u32, height: u32) -> f32 {
+        match self {
+            Self::Left | Self::Right => height as f32,
+            Self::Top | Self::Bottom => width as f32,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct DamageProfile {
+    values: Vec<f32>,
+}
+
+impl DamageProfile {
+    fn random<R: Rng + ?Sized>(control_count: usize, rng: &mut R) -> Self {
+        let mut value: f32 = rng.random_range(-0.05..=0.05);
+        let mut values = Vec::with_capacity(control_count);
+        values.push(value);
+
+        for _ in 1..control_count {
+            value = if rng.random_bool(0.16) {
+                let amplitude = rng.random_range(0.12..=0.18);
+                if rng.random_bool(0.5) {
+                    -amplitude
+                } else {
+                    amplitude
+                }
+            } else {
+                (value + rng.random_range(-0.05..=0.05)).clamp(-0.08, 0.08)
+            };
+            values.push(value);
+        }
+
+        Self { values }
+    }
+
+    fn sample(&self, position: f32) -> f32 {
+        debug_assert!(self.values.len() >= 2);
+        let segments = self.values.len() - 1;
+        let scaled = position.clamp(0.0, 1.0) * segments as f32;
+        let index = scaled.floor() as usize;
+        if index >= segments {
+            return self.values[segments];
+        }
+        let previous = self.values[index.saturating_sub(1)];
+        let current = self.values[index];
+        let next = self.values[index + 1];
+        let following = self.values[(index + 2).min(segments)];
+        let progress = scaled - index as f32;
+        let progress_squared = progress * progress;
+        let progress_cubed = progress_squared * progress;
+        let interpolated = 0.5
+            * ((2.0 * current)
+                + (-previous + next) * progress
+                + (2.0 * previous - 5.0 * current + 4.0 * next - following) * progress_squared
+                + (-previous + 3.0 * current - 3.0 * next + following) * progress_cubed);
+
+        interpolated.clamp(
+            previous.min(current).min(next).min(following),
+            previous.max(current).max(next).max(following),
+        )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
 struct DamageSegment {
-    center_x: f32,
-    center_y: f32,
-    half_width: f32,
-    half_height: f32,
-    sin_angle: f32,
-    cos_angle: f32,
+    edge: DamageEdge,
+    along_center: f32,
+    along_half_length: f32,
+    penetration: f32,
     intensity: f32,
-    softness: f32,
-    deformation: f32,
-    x_frequency: f32,
-    y_frequency: f32,
-    x_phase: f32,
-    y_phase: f32,
-    fragment_frequency: f32,
-    fragment_phase: f32,
+    base_softness: f32,
+    irregularity: DamageProfile,
 }
 
 impl DamageSegment {
     fn rasterize(&self, effects: &mut [f32], width: u32, height: u32, blur: BlurParameters) {
-        let sharp_softness = (self.half_width.min(self.half_height) * 0.025).max(1.0);
-        let softness = lerp(
-            sharp_softness,
-            self.softness.max(sharp_softness),
-            blur.fraction,
-        );
-        let padding = softness * 2.0 + self.deformation;
-        let extent_x = self.cos_angle.abs() * self.half_width
-            + self.sin_angle.abs() * self.half_height
-            + padding;
-        let extent_y = self.sin_angle.abs() * self.half_width
-            + self.cos_angle.abs() * self.half_height
-            + padding;
-        let Some((start_x, end_x, start_y, end_y)) = image_bounds(
-            width,
-            height,
-            self.center_x - extent_x,
-            self.center_x + extent_x,
-            self.center_y - extent_y,
-            self.center_y + extent_y,
-        ) else {
+        let short_dimension = (self.along_half_length * 2.0).min(self.penetration);
+        let boundary_softness = self.boundary_softness(short_dimension, blur);
+        let end_softness = boundary_softness
+            .min((self.along_half_length * 0.20).max(1.0))
+            .max(1.0);
+        let maximum_penetration = self.penetration * 1.18 + boundary_softness;
+        let (min_x, max_x, min_y, max_y) = match self.edge {
+            DamageEdge::Left => (
+                0.0,
+                maximum_penetration,
+                self.along_center - self.along_half_length - end_softness,
+                self.along_center + self.along_half_length + end_softness,
+            ),
+            DamageEdge::Right => (
+                width as f32 - maximum_penetration,
+                width as f32,
+                self.along_center - self.along_half_length - end_softness,
+                self.along_center + self.along_half_length + end_softness,
+            ),
+            DamageEdge::Top => (
+                self.along_center - self.along_half_length - end_softness,
+                self.along_center + self.along_half_length + end_softness,
+                0.0,
+                maximum_penetration,
+            ),
+            DamageEdge::Bottom => (
+                self.along_center - self.along_half_length - end_softness,
+                self.along_center + self.along_half_length + end_softness,
+                height as f32 - maximum_penetration,
+                height as f32,
+            ),
+        };
+        let Some((start_x, end_x, start_y, end_y)) =
+            image_bounds(width, height, min_x, max_x, min_y, max_y)
+        else {
             return;
         };
 
         for y in start_y..=end_y {
             for x in start_x..=end_x {
-                let dx = x as f32 + 0.5 - self.center_x;
-                let dy = y as f32 + 0.5 - self.center_y;
-                let local_x = dx * self.cos_angle + dy * self.sin_angle;
-                let local_y = -dx * self.sin_angle + dy * self.cos_angle;
-                let normalized_x = local_x / self.half_width;
-                let normalized_y = local_y / self.half_height;
-                let boundary_wave = 0.52
-                    * (normalized_x * self.x_frequency * std::f32::consts::TAU + self.x_phase)
-                        .sin()
-                    + 0.33
-                        * (normalized_y * self.y_frequency * std::f32::consts::TAU + self.y_phase)
-                            .sin()
-                    + 0.15
-                        * ((normalized_x * self.x_frequency * 0.53
-                            + normalized_y * self.y_frequency * 0.79)
-                            * std::f32::consts::TAU
-                            + self.x_phase
-                            - self.y_phase)
-                            .sin();
-                let boundary_offset = self.deformation * boundary_wave;
-                let signed_distance =
-                    rounded_box_distance(local_x, local_y, self.half_width, self.half_height)
-                        + boundary_offset;
-                let coverage = soft_rectangle_coverage(signed_distance, softness);
-                if coverage == 0.0 {
-                    continue;
-                }
-
-                let fragment = (0.78
-                    + 0.15
-                        * (normalized_x * self.fragment_frequency * std::f32::consts::TAU
-                            + self.fragment_phase)
-                            .sin()
-                        * (normalized_y * self.fragment_frequency * 0.71 * std::f32::consts::TAU
-                            - self.fragment_phase)
-                            .sin()
-                    + 0.07
-                        * ((normalized_x * 0.43 + normalized_y * 0.67)
-                            * self.fragment_frequency
-                            * std::f32::consts::TAU
-                            + self.fragment_phase * 0.3)
-                            .sin())
-                .clamp(0.38, 1.0);
-                let contribution = self.intensity * coverage * fragment;
+                let (along_position, inward_distance) = match self.edge {
+                    DamageEdge::Left => (y as f32 + 0.5, x as f32 + 0.5),
+                    DamageEdge::Right => (y as f32 + 0.5, width as f32 - (x as f32 + 0.5)),
+                    DamageEdge::Top => (x as f32 + 0.5, y as f32 + 0.5),
+                    DamageEdge::Bottom => (x as f32 + 0.5, height as f32 - (y as f32 + 0.5)),
+                };
+                let normalized_position = ((along_position
+                    - (self.along_center - self.along_half_length))
+                    / (self.along_half_length * 2.0))
+                    .clamp(0.0, 1.0);
+                let end_progress = ((along_position - self.along_center).abs()
+                    / self.along_half_length)
+                    .clamp(0.0, 1.0);
+                let end_taper = 1.0 - smoothstep(0.68, 1.0, end_progress);
+                let local_penetration = (self.penetration
+                    * (0.20 + 0.80 * end_taper)
+                    * (1.0 + self.irregularity.sample(normalized_position)))
+                .max(0.5);
+                let end_coverage = soft_rectangle_coverage(
+                    (along_position - self.along_center).abs() - self.along_half_length,
+                    end_softness,
+                );
+                let inward_coverage =
+                    soft_rectangle_coverage(inward_distance - local_penetration, boundary_softness);
+                let contribution = self.intensity * end_coverage * inward_coverage;
                 if contribution >= TAIL_THRESHOLD {
                     accumulate_pixel(effects, width, x, y, contribution);
                 }
             }
         }
+    }
+
+    fn boundary_softness(&self, short_dimension: f32, blur: BlurParameters) -> f32 {
+        lerp(self.base_softness, 0.20 * short_dimension, blur.fraction)
+    }
+
+    #[cfg(test)]
+    fn intersects_frame(&self, width: u32, height: u32) -> bool {
+        let edge_length = self.edge.along_length(width, height);
+        self.penetration > 0.0
+            && self.along_center + self.along_half_length >= 0.0
+            && self.along_center - self.along_half_length <= edge_length
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DamageCluster {
+    edge: DamageEdge,
+    along_anchor: f32,
+}
+
+fn damage_edges(placements: &[BokehPlacement]) -> Vec<DamageEdge> {
+    placements
+        .iter()
+        .filter_map(|placement| match placement {
+            BokehPlacement::Left => Some(DamageEdge::Left),
+            BokehPlacement::Right => Some(DamageEdge::Right),
+            BokehPlacement::Top => Some(DamageEdge::Top),
+            BokehPlacement::Bottom => Some(DamageEdge::Bottom),
+            BokehPlacement::Center => None,
+        })
+        .collect()
+}
+
+fn select_damage_edge<R: Rng + ?Sized>(edges: &[DamageEdge], rng: &mut R) -> DamageEdge {
+    if !edges.is_empty() {
+        return edges[rng.random_range(0..edges.len())];
+    }
+
+    match rng.random_range(0..4) {
+        0 => DamageEdge::Left,
+        1 => DamageEdge::Right,
+        2 => DamageEdge::Top,
+        _ => DamageEdge::Bottom,
     }
 }
 
@@ -814,20 +954,19 @@ fn generate_damage_segments<R: Rng + ?Sized>(
     rng: &mut R,
 ) -> Vec<DamageSegment> {
     let count = damage_count(settings.render.density);
-    let longest_side = width.max(height) as f32;
-    let cluster_count = (1 + count / 7).clamp(1, 5);
+    let cluster_count = (1 + count / 5).clamp(1, 5);
+    let edges = damage_edges(&settings.placements);
     let mut clusters = Vec::with_capacity(cluster_count);
-    let cluster_spread = longest_side * (0.05 + maximum_scale(settings.size) * 0.11);
 
     for _ in 0..cluster_count {
-        clusters.push(placement_position(
-            selected_placement(&settings.placements, rng),
-            width,
-            height,
-            rng,
-        ));
+        let edge = select_damage_edge(&edges, rng);
+        clusters.push(DamageCluster {
+            edge,
+            along_anchor: rng.random_range(0.0..edge.along_length(width, height)),
+        });
     }
 
+    let cluster_spread = 0.08 + maximum_scale(settings.size) * 0.20;
     let mut segments = Vec::with_capacity(count);
     for index in 0..count {
         let scale = sample_object_scale_at(
@@ -836,56 +975,40 @@ fn generate_damage_segments<R: Rng + ?Sized>(
             stratified_quantile(index, count, rng),
             rng,
         );
-        let (center_x, center_y) = if rng.random_bool(0.74) {
-            let (cluster_x, cluster_y) = clusters[rng.random_range(0..clusters.len())];
+        let (edge, along_center) = if rng.random_bool(0.74) {
+            let cluster = clusters[rng.random_range(0..clusters.len())];
+            let edge_length = cluster.edge.along_length(width, height);
             (
-                cluster_x + bell_curve_offset(cluster_spread, rng),
-                cluster_y + bell_curve_offset(cluster_spread, rng),
+                cluster.edge,
+                (cluster.along_anchor + bell_curve_offset(edge_length * cluster_spread, rng))
+                    .clamp(0.0, edge_length),
             )
         } else {
-            placement_position(
-                selected_placement(&settings.placements, rng),
-                width,
-                height,
-                rng,
+            let edge = select_damage_edge(&edges, rng);
+            (
+                edge,
+                rng.random_range(0.0..edge.along_length(width, height)),
             )
         };
-        let characteristic = (longest_side * scale).max(2.0);
-        let half_extent = (characteristic * rng.random_range(0.08..0.24)).max(1.0);
-        let aspect = rng.random_range(0.38_f32..2.65_f32).sqrt();
-        let half_width = (half_extent * aspect).max(1.0);
-        let half_height = (half_extent / aspect).max(1.0);
-        let angle: f32 = rng.random_range(-0.20..0.20);
-        let softness = (half_width.min(half_height) * rng.random_range(0.18..0.40)).max(1.0);
+        // A shared scale prevents one independent axis from turning a chunk into a strip.
+        let characteristic =
+            (width.min(height) as f32 * scale * rng.random_range(0.10..=0.22)).max(5.0);
+        let along_length = (characteristic * rng.random_range(0.65..=1.45)).max(5.0);
+        let penetration = (characteristic * rng.random_range(0.55..=1.20)).max(5.0);
+        let base_softness = (0.01 * along_length.min(penetration)).max(1.0);
 
         segments.push(DamageSegment {
-            center_x,
-            center_y,
-            half_width,
-            half_height,
-            sin_angle: angle.sin(),
-            cos_angle: angle.cos(),
-            intensity: rng.random_range(0.16..0.62),
-            softness,
-            deformation: softness * rng.random_range(0.25..0.90),
-            x_frequency: rng.random_range(0.45..1.35),
-            y_frequency: rng.random_range(0.45..1.35),
-            x_phase: rng.random_range(0.0..std::f32::consts::TAU),
-            y_phase: rng.random_range(0.0..std::f32::consts::TAU),
-            fragment_frequency: rng.random_range(0.35..1.10),
-            fragment_phase: rng.random_range(0.0..std::f32::consts::TAU),
+            edge,
+            along_center,
+            along_half_length: along_length * 0.5,
+            penetration,
+            intensity: rng.random_range(0.18..0.62),
+            base_softness,
+            irregularity: DamageProfile::random(rng.random_range(3..=8), rng),
         });
     }
 
     segments
-}
-
-fn rounded_box_distance(x: f32, y: f32, half_width: f32, half_height: f32) -> f32 {
-    let dx = x.abs() - half_width;
-    let dy = y.abs() - half_height;
-    let outside = dx.max(0.0).hypot(dy.max(0.0));
-
-    outside + dx.max(dy).min(0.0)
 }
 
 fn soft_rectangle_coverage(signed_distance: f32, softness: f32) -> f32 {

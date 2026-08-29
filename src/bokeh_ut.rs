@@ -57,6 +57,7 @@ fn settings(
         types: types.to_vec(),
         placements: placements.to_vec(),
         blur: 100,
+        lightness: 70,
         size,
         uniform,
     }
@@ -168,7 +169,7 @@ fn bokeh_settings_validate_size_and_uniformity() {
 }
 
 #[test]
-fn bokeh_settings_validate_blur_and_edge_placement() {
+fn bokeh_settings_validate_blur_lightness_and_effect_placements() {
     let mut invalid_blur = settings(&[BokehType::Twinkle], &[], 50, 50, 50);
     invalid_blur.blur = 101;
     assert!(matches!(
@@ -178,10 +179,74 @@ fn bokeh_settings_validate_blur_and_edge_placement() {
 
     let invalid_edge_placement =
         settings(&[BokehType::Edge], &[BokehPlacement::Center], 50, 50, 50);
+    let error = invalid_edge_placement
+        .validate()
+        .expect_err("center-only edge placement should fail");
+    assert!(matches!(error, RenderError::InvalidBokehEdgePlacement));
+    assert_eq!(
+        error.to_string(),
+        "center placement is not available for edge bokeh"
+    );
+
+    let invalid_damage_placement =
+        settings(&[BokehType::Damage], &[BokehPlacement::Center], 50, 50, 50);
+    let error = invalid_damage_placement
+        .validate()
+        .expect_err("center-only damage placement should fail");
+    assert!(matches!(error, RenderError::InvalidBokehDamagePlacement));
+    assert_eq!(
+        error.to_string(),
+        "center placement is not available for damage bokeh"
+    );
+
+    let mut invalid_lightness = settings(&[BokehType::Twinkle], &[], 50, 50, 50);
+    invalid_lightness.lightness = 101;
     assert!(matches!(
-        invalid_edge_placement.validate(),
-        Err(RenderError::InvalidBokehEdgePlacement)
+        invalid_lightness.validate(),
+        Err(RenderError::InvalidLightness(101))
     ));
+
+    let mixed_placements = settings(
+        &[BokehType::Twinkle, BokehType::Edge, BokehType::Damage],
+        &[BokehPlacement::Center, BokehPlacement::Left],
+        50,
+        50,
+        50,
+    );
+    assert!(mixed_placements.validate().is_ok());
+}
+
+#[test]
+fn placements_are_filtered_per_effect_without_rejecting_mixed_requests() {
+    let settings = settings(
+        &[BokehType::Twinkle, BokehType::Edge, BokehType::Damage],
+        &[
+            BokehPlacement::Center,
+            BokehPlacement::Left,
+            BokehPlacement::Right,
+        ],
+        50,
+        50,
+        50,
+    );
+
+    assert!(settings.validate().is_ok());
+    assert_eq!(
+        settings_for_type(&settings, BokehType::Twinkle).placements,
+        vec![
+            BokehPlacement::Center,
+            BokehPlacement::Left,
+            BokehPlacement::Right,
+        ]
+    );
+    assert_eq!(
+        settings_for_type(&settings, BokehType::Edge).placements,
+        vec![BokehPlacement::Left, BokehPlacement::Right]
+    );
+    assert_eq!(
+        settings_for_type(&settings, BokehType::Damage).placements,
+        vec![BokehPlacement::Left, BokehPlacement::Right]
+    );
 }
 
 #[test]
@@ -317,7 +382,65 @@ fn density_zero_produces_an_empty_scalar_render() {
         &mut rng,
     );
 
-    assert!(image.pixels().all(|pixel| pixel.0 == [255, 255, 255, 0]));
+    let luma = bokeh_luma(70);
+    assert!(image.pixels().all(|pixel| pixel.0 == [luma, luma, luma, 0]));
+}
+
+#[test]
+fn bokeh_lightness_uses_the_required_grayscale_anchors() {
+    assert_eq!(bokeh_luma(0), 0);
+    assert_eq!(bokeh_luma(25), 64);
+    assert_eq!(bokeh_luma(50), 128);
+    assert_eq!(bokeh_luma(75), 191);
+    assert_eq!(bokeh_luma(100), 255);
+}
+
+#[test]
+fn lightness_changes_rgb_without_changing_seeded_alpha_or_geometry() {
+    let mut dim = settings(
+        &[BokehType::Twinkle, BokehType::Edge, BokehType::Damage],
+        &[BokehPlacement::Center, BokehPlacement::Left],
+        50,
+        70,
+        25,
+    );
+    dim.lightness = 20;
+    let mut bright = dim.clone();
+    bright.lightness = 80;
+
+    let mut dim_rng = StdRng::seed_from_u64(94);
+    let dim_image = render_image(&dim, &mut dim_rng);
+    let mut bright_rng = StdRng::seed_from_u64(94);
+    let bright_image = render_image(&bright, &mut bright_rng);
+
+    for (dim_pixel, bright_pixel) in dim_image.pixels().zip(bright_image.pixels()) {
+        assert_eq!(dim_pixel[3], bright_pixel[3]);
+        assert_eq!(&dim_pixel.0[..3], &[bokeh_luma(20); 3]);
+        assert_eq!(&bright_pixel.0[..3], &[bokeh_luma(80); 3]);
+    }
+
+    let mut dim_rng = StdRng::seed_from_u64(95);
+    let mut bright_rng = StdRng::seed_from_u64(95);
+    assert_eq!(
+        generate_twinkles(&dim, 1_000, 667, &mut dim_rng),
+        generate_twinkles(&bright, 1_000, 667, &mut bright_rng)
+    );
+    let mut dim_rng = StdRng::seed_from_u64(96);
+    let mut bright_rng = StdRng::seed_from_u64(96);
+    let dim_edge = settings_for_type(&dim, BokehType::Edge);
+    let bright_edge = settings_for_type(&bright, BokehType::Edge);
+    assert_eq!(
+        generate_edge_exposures(&dim_edge, 1_000, 667, &mut dim_rng),
+        generate_edge_exposures(&bright_edge, 1_000, 667, &mut bright_rng)
+    );
+    let mut dim_rng = StdRng::seed_from_u64(97);
+    let mut bright_rng = StdRng::seed_from_u64(97);
+    let dim_damage = settings_for_type(&dim, BokehType::Damage);
+    let bright_damage = settings_for_type(&bright, BokehType::Damage);
+    assert_eq!(
+        generate_damage_segments(&dim_damage, 1_000, 667, &mut dim_rng),
+        generate_damage_segments(&bright_damage, 1_000, 667, &mut bright_rng)
+    );
 }
 
 #[test]
@@ -618,41 +741,210 @@ fn blur_does_not_change_seeded_primitive_geometry() {
     );
 }
 
+fn damage_segment(edge: DamageEdge) -> DamageSegment {
+    DamageSegment {
+        edge,
+        along_center: 40.0,
+        along_half_length: 22.0,
+        penetration: 24.0,
+        intensity: 0.7,
+        base_softness: 1.0,
+        irregularity: DamageProfile {
+            values: vec![0.0, 0.0, 0.0],
+        },
+    }
+}
+
 #[test]
-fn damage_segments_have_varied_deterministic_geometry() {
+fn damage_blur_uses_the_requested_boundary_softness_range() {
+    let segment = damage_segment(DamageEdge::Left);
+    let short_dimension = 24.0;
+
+    assert_close(
+        segment.boundary_softness(short_dimension, BlurParameters::new(0, 120, 80)),
+        1.0,
+    );
+    assert_close(
+        segment.boundary_softness(short_dimension, BlurParameters::new(100, 120, 80)),
+        0.20 * short_dimension,
+    );
+}
+
+#[test]
+fn generated_damage_intersects_each_requested_frame_edge() {
+    for (index, (placement, edge)) in [
+        (BokehPlacement::Left, DamageEdge::Left),
+        (BokehPlacement::Right, DamageEdge::Right),
+        (BokehPlacement::Top, DamageEdge::Top),
+        (BokehPlacement::Bottom, DamageEdge::Bottom),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let settings = settings(&[BokehType::Damage], &[placement], 50, 50, 30);
+        let mut rng = StdRng::seed_from_u64(98 + index as u64);
+        let segments = generate_damage_segments(&settings, 640, 400, &mut rng);
+
+        assert!(!segments.is_empty());
+        for segment in segments {
+            assert_eq!(segment.edge, edge);
+            assert!(segment.intersects_frame(640, 400));
+
+            let mut effects = vec![0.0; 640 * 400];
+            segment.rasterize(&mut effects, 640, 400, BlurParameters::new(0, 640, 400));
+            let touches_frame = match edge {
+                DamageEdge::Left => (0..400).any(|y| effect_at(&effects, 640, 0, y) > 0.0),
+                DamageEdge::Right => (0..400).any(|y| effect_at(&effects, 640, 639, y) > 0.0),
+                DamageEdge::Top => (0..640).any(|x| effect_at(&effects, 640, x, 0) > 0.0),
+                DamageEdge::Bottom => (0..640).any(|x| effect_at(&effects, 640, x, 399) > 0.0),
+            };
+            assert!(touches_frame, "{edge:?} damage should touch the frame");
+        }
+    }
+}
+
+#[test]
+fn damage_ignores_center_when_valid_frame_edges_are_also_requested() {
+    let settings = settings(
+        &[BokehType::Damage],
+        &[
+            BokehPlacement::Center,
+            BokehPlacement::Left,
+            BokehPlacement::Right,
+        ],
+        50,
+        50,
+        30,
+    );
+    let filtered = settings_for_type(&settings, BokehType::Damage);
+    let mut rng = StdRng::seed_from_u64(102);
+    let segments = generate_damage_segments(&filtered, 640, 400, &mut rng);
+
+    assert_eq!(
+        filtered.placements,
+        [BokehPlacement::Left, BokehPlacement::Right]
+    );
+    assert!(segments.iter().all(|segment| {
+        matches!(segment.edge, DamageEdge::Left | DamageEdge::Right)
+            && segment.intersects_frame(640, 400)
+    }));
+}
+
+#[test]
+fn unplaced_damage_randomizes_across_all_physical_edges() {
+    let mut rng = StdRng::seed_from_u64(107);
+    let mut seen = [false; 4];
+
+    for _ in 0..256 {
+        match select_damage_edge(&[], &mut rng) {
+            DamageEdge::Left => seen[0] = true,
+            DamageEdge::Right => seen[1] = true,
+            DamageEdge::Top => seen[2] = true,
+            DamageEdge::Bottom => seen[3] = true,
+        }
+    }
+
+    assert!(seen.into_iter().all(|edge| edge));
+}
+
+#[test]
+fn damage_profiles_are_bounded_nonperiodic_and_smoothly_interpolated() {
+    let mut rng = StdRng::seed_from_u64(103);
+    let profile = DamageProfile::random(8, &mut rng);
+    let samples: Vec<_> = (0..=1_000)
+        .map(|index| profile.sample(index as f32 / 1_000.0))
+        .collect();
+    let greatest_step = samples
+        .windows(2)
+        .map(|pair| (pair[0] - pair[1]).abs())
+        .fold(0.0, f32::max);
+
+    assert_eq!(profile.values.len(), 8);
+    assert!(profile.values.iter().all(|value| value.abs() <= 0.18));
+    assert!(samples.iter().all(|value| value.abs() <= 0.18));
+    assert!(
+        greatest_step < 0.01,
+        "damage profile should not form hard steps"
+    );
+}
+
+#[test]
+fn damage_geometry_is_deterministic_and_varied() {
     let settings = settings(&[BokehType::Damage], &[BokehPlacement::Right], 50, 40, 40);
-    let mut first_rng = StdRng::seed_from_u64(78);
+    let mut first_rng = StdRng::seed_from_u64(104);
     let first = generate_damage_segments(&settings, 640, 400, &mut first_rng);
-    let mut second_rng = StdRng::seed_from_u64(78);
+    let mut second_rng = StdRng::seed_from_u64(104);
     let second = generate_damage_segments(&settings, 640, 400, &mut second_rng);
 
     assert_eq!(first, second);
     assert!(first.len() > 4);
     assert!(first.iter().any(|segment| {
-        (segment.half_width - first[0].half_width).abs() > 0.01
-            || (segment.half_height - first[0].half_height).abs() > 0.01
+        (segment.penetration - first[0].penetration).abs() > 0.01
+            || (segment.along_half_length - first[0].along_half_length).abs() > 0.01
     }));
 }
 
 #[test]
-fn damage_boundaries_are_soft_and_not_binary_rectangles() {
-    let segment = DamageSegment {
-        center_x: 60.0,
-        center_y: 40.0,
-        half_width: 25.0,
-        half_height: 14.0,
-        sin_angle: 0.0,
-        cos_angle: 1.0,
-        intensity: 0.7,
-        softness: 6.0,
-        deformation: 2.0,
-        x_frequency: 0.7,
-        y_frequency: 0.9,
-        x_phase: 0.2,
-        y_phase: 1.1,
-        fragment_frequency: 0.6,
-        fragment_phase: 0.4,
+fn damage_size_and_uniformity_control_only_segment_scale() {
+    let mut small = settings(&[BokehType::Damage], &[BokehPlacement::Right], 100, 25, 50);
+    let mut large = small.clone();
+    large.size = 100;
+    let mut small_rng = StdRng::seed_from_u64(105);
+    let small_segments = generate_damage_segments(&small, 1_000, 667, &mut small_rng);
+    let mut large_rng = StdRng::seed_from_u64(105);
+    let large_segments = generate_damage_segments(&large, 1_000, 667, &mut large_rng);
+
+    assert_eq!(small_segments.len(), large_segments.len());
+    assert!(
+        small_segments
+            .iter()
+            .map(|segment| segment.penetration)
+            .fold(0.0, f32::max)
+            < large_segments
+                .iter()
+                .map(|segment| segment.penetration)
+                .fold(0.0, f32::max)
+    );
+
+    small.uniform = 0;
+    let mut uniform = small.clone();
+    uniform.uniform = 100;
+    let mut low_uniform_rng = StdRng::seed_from_u64(106);
+    let low_uniform = generate_damage_segments(&small, 1_000, 667, &mut low_uniform_rng);
+    let mut high_uniform_rng = StdRng::seed_from_u64(106);
+    let high_uniform = generate_damage_segments(&uniform, 1_000, 667, &mut high_uniform_rng);
+    let minimum_penetration = |segments: &[DamageSegment]| {
+        segments
+            .iter()
+            .map(|segment| segment.penetration)
+            .fold(f32::INFINITY, f32::min)
     };
+    let average_penetration = |segments: &[DamageSegment]| {
+        segments
+            .iter()
+            .map(|segment| segment.penetration)
+            .sum::<f32>()
+            / segments.len() as f32
+    };
+
+    assert_eq!(low_uniform.len(), high_uniform.len());
+    assert!(minimum_penetration(&low_uniform) < minimum_penetration(&high_uniform));
+    assert!(average_penetration(&low_uniform) < average_penetration(&high_uniform));
+    assert!(
+        low_uniform
+            .iter()
+            .all(|segment| segment.edge == DamageEdge::Right)
+    );
+    assert!(
+        high_uniform
+            .iter()
+            .all(|segment| segment.edge == DamageEdge::Right)
+    );
+}
+
+#[test]
+fn damage_interior_is_uniform_and_boundaries_are_feathered() {
+    let segment = damage_segment(DamageEdge::Left);
     let mut effects = vec![0.0; 120 * 80];
     segment.rasterize(&mut effects, 120, 80, BlurParameters::new(100, 120, 80));
     let levels: BTreeSet<_> = effects
@@ -661,44 +953,29 @@ fn damage_boundaries_are_soft_and_not_binary_rectangles() {
         .map(|effect| (effect * 10_000.0).round() as i32)
         .collect();
 
-    assert!(effect_at(&effects, 120, 60, 40) > 0.2);
-    assert_eq!(effect_at(&effects, 120, 110, 40), 0.0);
+    assert_close(
+        effect_at(&effects, 120, 5, 30),
+        effect_at(&effects, 120, 5, 50),
+    );
+    assert!(effect_at(&effects, 120, 0, 40) > 0.2);
+    assert_eq!(effect_at(&effects, 120, 90, 40), 0.0);
     assert!(
         levels.len() > 16,
-        "damage should contain soft intermediate values"
+        "damage should retain feathered boundaries"
     );
 }
 
 #[test]
 fn damage_blur_changes_only_the_boundary_feather() {
-    let segment = DamageSegment {
-        center_x: 60.0,
-        center_y: 40.0,
-        half_width: 25.0,
-        half_height: 14.0,
-        sin_angle: 0.0,
-        cos_angle: 1.0,
-        intensity: 0.7,
-        softness: 6.0,
-        deformation: 0.0,
-        x_frequency: 0.7,
-        y_frequency: 0.9,
-        x_phase: 0.2,
-        y_phase: 1.1,
-        fragment_frequency: 0.6,
-        fragment_phase: 0.4,
-    };
+    let segment = damage_segment(DamageEdge::Left);
     let mut sharp = vec![0.0; 120 * 80];
     segment.rasterize(&mut sharp, 120, 80, BlurParameters::new(0, 120, 80));
     let mut soft = vec![0.0; 120 * 80];
     segment.rasterize(&mut soft, 120, 80, BlurParameters::new(100, 120, 80));
 
-    assert_close(
-        effect_at(&sharp, 120, 60, 40),
-        effect_at(&soft, 120, 60, 40),
-    );
-    assert_eq!(effect_at(&sharp, 120, 88, 40), 0.0);
-    assert!(effect_at(&soft, 120, 88, 40) > 0.0);
+    assert_close(effect_at(&sharp, 120, 5, 40), effect_at(&soft, 120, 5, 40));
+    assert_eq!(effect_at(&sharp, 120, 27, 40), 0.0);
+    assert!(effect_at(&soft, 120, 27, 40) > 0.0);
 }
 
 #[test]
@@ -748,11 +1025,11 @@ fn bokeh_rendering_is_seeded_deterministic_and_monochrome() {
 
     assert_eq!(first, second);
     assert!(first.pixels().any(|pixel| pixel[3] > 0));
-    assert!(
-        first
-            .pixels()
-            .all(|pixel| pixel[0] == 255 && pixel[1] == 255 && pixel[2] == 255)
-    );
+    assert!(first.pixels().all(|pixel| {
+        pixel[0] == bokeh_luma(settings.lightness)
+            && pixel[1] == bokeh_luma(settings.lightness)
+            && pixel[2] == bokeh_luma(settings.lightness)
+    }));
 }
 
 #[test]

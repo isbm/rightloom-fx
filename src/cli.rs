@@ -43,6 +43,7 @@ pub(crate) struct BokehArgs {
     pub(crate) types: Vec<BokehType>,
     pub(crate) placements: Vec<BokehPlacement>,
     pub(crate) blur: u8,
+    pub(crate) lightness: u8,
     pub(crate) size: u8,
     pub(crate) uniform: u8,
 }
@@ -98,6 +99,9 @@ impl Cli {
                 blur: *arguments
                     .get_one("blur")
                     .expect("clap supplies the bokeh blur default"),
+                lightness: *arguments
+                    .get_one("lightness")
+                    .expect("clap supplies the bokeh lightness default"),
                 size: *arguments
                     .get_one("size")
                     .expect("clap supplies the bokeh size default"),
@@ -277,6 +281,15 @@ fn bokeh_command(styles: styling::Styles) -> ClapCommand {
                     .help("Bokeh edge softness, 0-100.\n0 = sharpest optical edge, 100 = maximum diffusion.")
                     .default_value("100")
                     .value_parser(parse_blur),
+            )
+            .arg(
+                Arg::new("lightness")
+                    .short('l')
+                    .long("lightness")
+                    .value_name("PERCENT")
+                    .help("Bokeh layer brightness, 0-100.\nChanges RGB brightness without changing alpha.")
+                    .default_value("70")
+                    .value_parser(parse_lightness),
             )
             .arg(
                 Arg::new("size")
