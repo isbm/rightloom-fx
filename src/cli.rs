@@ -44,6 +44,7 @@ pub(crate) struct BokehArgs {
     pub(crate) placements: Vec<BokehPlacement>,
     pub(crate) blur: u8,
     pub(crate) lightness: u8,
+    pub(crate) deform: u8,
     pub(crate) size: u8,
     pub(crate) uniform: u8,
 }
@@ -102,6 +103,9 @@ impl Cli {
                 lightness: *arguments
                     .get_one("lightness")
                     .expect("clap supplies the bokeh lightness default"),
+                deform: *arguments
+                    .get_one("deform")
+                    .expect("clap supplies the bokeh deform default"),
                 size: *arguments
                     .get_one("size")
                     .expect("clap supplies the bokeh size default"),
@@ -292,6 +296,15 @@ fn bokeh_command(styles: styling::Styles) -> ClapCommand {
                     .value_parser(parse_lightness),
             )
             .arg(
+                Arg::new("deform")
+                    .short('f')
+                    .long("deform")
+                    .value_name("PERCENT")
+                    .help("Twinkle shape deformation, 0-100.\n0 = perfect circle, 100 = maximum organic deformation.")
+                    .default_value("0")
+                    .value_parser(parse_deform),
+            )
+            .arg(
                 Arg::new("size")
                     .short('s')
                     .long("size")
@@ -451,6 +464,10 @@ pub(crate) fn parse_size(value: &str) -> Result<u8, String> {
 
 pub(crate) fn parse_uniform(value: &str) -> Result<u8, String> {
     parse_bokeh_percentage(value, "uniform")
+}
+
+pub(crate) fn parse_deform(value: &str) -> Result<u8, String> {
+    parse_bokeh_percentage(value, "deform")
 }
 
 fn parse_bokeh_percentage(value: &str, name: &str) -> Result<u8, String> {

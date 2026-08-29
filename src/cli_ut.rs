@@ -2,8 +2,8 @@ use std::str::FromStr;
 
 use super::{
     Cli, Command, cli, parse_amount, parse_background, parse_blur, parse_bokeh_places,
-    parse_bokeh_type, parse_contrast, parse_density, parse_lightness, parse_scratch_type,
-    parse_size, parse_uniform,
+    parse_bokeh_type, parse_contrast, parse_deform, parse_density, parse_lightness,
+    parse_scratch_type, parse_size, parse_uniform,
 };
 use crate::bokeh::{BokehPlacement, BokehType};
 use crate::render::{ExportPolicy, RgbColor};
@@ -160,6 +160,7 @@ fn bokeh_subcommand_and_each_type_parse() {
         assert_eq!(args.types, [expected]);
         assert_eq!(args.blur, 100);
         assert_eq!(args.lightness, 70);
+        assert_eq!(args.deform, 0);
         assert_eq!(args.size, 50);
         assert_eq!(args.uniform, 50);
     }
@@ -295,6 +296,30 @@ fn bokeh_lightness_defaults_to_70_and_accepts_percentage_endpoints() {
     }
 
     assert!(parse_bokeh(&["-t", "twinkle", "-l", "101"]).is_err());
+}
+
+#[test]
+fn bokeh_deform_defaults_to_0_and_accepts_percentage_endpoints() {
+    for value in ["0", "100"] {
+        let cli = parse_bokeh(&["-t", "twinkle", "-f", value])
+            .expect("in-range bokeh deform should parse");
+        let deform = match cli.command {
+            Command::Bokeh(args) => args.deform,
+            Command::Scratches(_) | Command::Stain(_) => {
+                panic!("bokeh command should parse as bokeh")
+            }
+        };
+
+        assert_eq!(
+            deform,
+            value.parse::<u8>().expect("test deform should parse")
+        );
+    }
+
+    assert_eq!(parse_deform("0"), Ok(0));
+    assert_eq!(parse_deform("100"), Ok(100));
+    assert!(parse_deform("101").is_err());
+    assert!(parse_bokeh(&["-t", "twinkle", "--deform", "101"]).is_err());
 }
 
 #[test]
@@ -508,10 +533,11 @@ fn stain_help_documents_blur_lightness_and_contrast() {
     assert!(help.contains("[default: 50]"));
     assert!(help.contains("--alpha"));
     assert!(help.contains("--background <RRGGBB>"));
+    assert!(!help.contains("--deform"));
 }
 
 #[test]
-fn bokeh_help_documents_its_blur_and_lightness_controls() {
+fn bokeh_help_documents_its_blur_lightness_and_deform_controls() {
     let command = cli();
     let error = command
         .try_get_matches_from(["rightloom-fx", "bokeh", "--help"])
@@ -526,6 +552,10 @@ fn bokeh_help_documents_its_blur_and_lightness_controls() {
     assert!(help.contains("Bokeh layer brightness, 0-100."));
     assert!(help.contains("Changes RGB brightness without changing alpha."));
     assert!(help.contains("[default: 70]"));
+    assert!(help.contains("-f, --deform <PERCENT>"));
+    assert!(help.contains("Twinkle shape deformation, 0-100."));
+    assert!(help.contains("0 = perfect circle, 100 = maximum organic deformation."));
+    assert!(help.contains("[default: 0]"));
 }
 
 #[test]
@@ -538,6 +568,7 @@ fn scratches_help_does_not_expose_stain_only_controls() {
 
     assert!(!help.contains("--lightness"));
     assert!(!help.contains("--contrast"));
+    assert!(!help.contains("--deform"));
 }
 
 #[test]

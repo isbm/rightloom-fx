@@ -104,6 +104,7 @@ pub struct BokehSettings {
     pub placements: Vec<BokehPlacement>,
     pub blur: u8,
     pub lightness: u8,
+    pub deform: u8,
     pub size: u8,
     pub uniform: u8,
 }
@@ -129,6 +130,9 @@ impl BokehSettings {
         }
         if self.lightness > 100 {
             return Err(RenderError::InvalidLightness(self.lightness));
+        }
+        if self.deform > 100 {
+            return Err(RenderError::InvalidDeform(self.deform));
         }
         if self.size > 100 {
             return Err(RenderError::InvalidSize(self.size));
@@ -189,7 +193,7 @@ fn render_image<R: Rng + ?Sized>(settings: &BokehSettings, rng: &mut R) -> RgbaI
         match bokeh_type {
             BokehType::Twinkle => {
                 for twinkle in generate_twinkles(&effect_settings, width, height, rng) {
-                    twinkle.rasterize(&mut effects, width, height, blur);
+                    twinkle.rasterize(&mut effects, width, height, blur, effect_settings.deform);
                 }
             }
             BokehType::Edge => {
@@ -386,14 +390,23 @@ struct Twinkle {
 }
 
 impl Twinkle {
-    fn rasterize(&self, effects: &mut [f32], width: u32, height: u32, blur: BlurParameters) {
+    fn rasterize(
+        &self,
+        effects: &mut [f32],
+        width: u32,
+        height: u32,
+        blur: BlurParameters,
+        deform: u8,
+    ) {
+        let deform_amount = f32::from(deform) / 100.0;
         let nominal_radius = self.radius_x.min(self.radius_y);
         let softness = blur.twinkle_softness(nominal_radius);
-        let tail = (1.0 + softness / nominal_radius) * (1.0 + self.deformation);
+        let radius_y = self.effective_radius_y(deform);
+        let tail = (1.0 + softness / nominal_radius) * (1.0 + deform_amount * self.deformation);
         let extent_x =
-            (self.cos_angle.abs() * self.radius_x + self.sin_angle.abs() * self.radius_y) * tail;
+            (self.cos_angle.abs() * self.radius_x + self.sin_angle.abs() * radius_y) * tail;
         let extent_y =
-            (self.sin_angle.abs() * self.radius_x + self.cos_angle.abs() * self.radius_y) * tail;
+            (self.sin_angle.abs() * self.radius_x + self.cos_angle.abs() * radius_y) * tail;
         let Some((start_x, end_x, start_y, end_y)) = image_bounds(
             width,
             height,
@@ -411,12 +424,14 @@ impl Twinkle {
                 let dy = y as f32 + 0.5 - self.center_y;
                 let local_x = dx * self.cos_angle + dy * self.sin_angle;
                 let local_y = -dx * self.sin_angle + dy * self.cos_angle;
-                let angle = local_y.atan2(local_x);
-                let radial_adjustment = 1.0
-                    + self.deformation
-                        * (self.deformation_frequency * angle + self.deformation_phase).sin();
-                let d2 = (local_x / self.radius_x).powi(2) + (local_y / self.radius_y).powi(2);
-                let normalized_distance = d2.sqrt() / radial_adjustment;
+                let normalized_distance = if deform == 0 {
+                    (dx * dx + dy * dy).sqrt() / self.radius_x
+                } else {
+                    let angle = local_y.atan2(local_x);
+                    let radial_adjustment = self.radial_adjustment(angle, deform);
+                    let d2 = (local_x / self.radius_x).powi(2) + (local_y / radius_y).powi(2);
+                    d2.sqrt() / radial_adjustment
+                };
                 let coverage =
                     soft_rectangle_coverage((normalized_distance - 1.0) * nominal_radius, softness);
                 let rim = smoothstep(0.52, 0.90, normalized_distance);
@@ -431,6 +446,35 @@ impl Twinkle {
                 }
             }
         }
+    }
+
+    fn effective_radius_y(&self, deform: u8) -> f32 {
+        match deform {
+            0 => self.radius_x,
+            100 => self.radius_y,
+            _ => lerp(self.radius_x, self.radius_y, f32::from(deform) / 100.0),
+        }
+    }
+
+    fn radial_adjustment(&self, angle: f32, deform: u8) -> f32 {
+        let wave = (self.deformation_frequency * angle + self.deformation_phase).sin();
+        match deform {
+            0 => 1.0,
+            100 => 1.0 + self.deformation * wave,
+            _ => 1.0 + f32::from(deform) / 100.0 * self.deformation * wave,
+        }
+    }
+
+    #[cfg(test)]
+    fn boundary_radius(&self, angle: f32, deform: u8) -> f32 {
+        if deform == 0 {
+            return self.radius_x;
+        }
+
+        let radius_y = self.effective_radius_y(deform);
+        let elliptical_radius =
+            1.0 / ((angle.cos() / self.radius_x).powi(2) + (angle.sin() / radius_y).powi(2)).sqrt();
+        elliptical_radius * self.radial_adjustment(angle, deform)
     }
 }
 

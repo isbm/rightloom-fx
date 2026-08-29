@@ -58,6 +58,7 @@ fn settings(
         placements: placements.to_vec(),
         blur: 100,
         lightness: 70,
+        deform: 0,
         size,
         uniform,
     }
@@ -204,6 +205,13 @@ fn bokeh_settings_validate_blur_lightness_and_effect_placements() {
     assert!(matches!(
         invalid_lightness.validate(),
         Err(RenderError::InvalidLightness(101))
+    ));
+
+    let mut invalid_deform = settings(&[BokehType::Twinkle], &[], 50, 50, 50);
+    invalid_deform.deform = 101;
+    assert!(matches!(
+        invalid_deform.validate(),
+        Err(RenderError::InvalidDeform(101))
     ));
 
     let mixed_placements = settings(
@@ -443,6 +451,146 @@ fn lightness_changes_rgb_without_changing_seeded_alpha_or_geometry() {
     );
 }
 
+fn geometric_twinkle() -> Twinkle {
+    Twinkle {
+        center_x: 60.0,
+        center_y: 40.0,
+        radius_x: 20.0,
+        radius_y: 26.0,
+        sin_angle: 0.6,
+        cos_angle: 0.8,
+        intensity: 0.6,
+        deformation: 0.06,
+        deformation_frequency: 2.0,
+        deformation_phase: 0.0,
+        glow_phase: 0.3,
+    }
+}
+
+#[test]
+fn deform_zero_is_a_perfect_circle_without_angular_modulation() {
+    let twinkle = geometric_twinkle();
+    let angles = [
+        0.0,
+        std::f32::consts::FRAC_PI_6,
+        std::f32::consts::FRAC_PI_4,
+        std::f32::consts::FRAC_PI_2,
+        std::f32::consts::PI,
+    ];
+
+    assert_eq!(twinkle.effective_radius_y(0) / twinkle.radius_x, 1.0);
+    for angle in angles {
+        assert_eq!(twinkle.radial_adjustment(angle, 0), 1.0);
+        assert_close(twinkle.boundary_radius(angle, 0), twinkle.radius_x);
+    }
+}
+
+#[test]
+fn deform_blends_the_existing_ellipse_and_angular_amplitude() {
+    let mut ellipse = geometric_twinkle();
+    ellipse.deformation = 0.0;
+    let angle = std::f32::consts::FRAC_PI_2;
+    let base_radius = ellipse.boundary_radius(angle, 0);
+    let half_radius = ellipse.boundary_radius(angle, 50);
+    let full_radius = ellipse.boundary_radius(angle, 100);
+
+    assert_eq!(ellipse.effective_radius_y(100), ellipse.radius_y);
+    assert_close(half_radius - base_radius, (full_radius - base_radius) * 0.5);
+
+    let mut wobble = geometric_twinkle();
+    wobble.radius_y = wobble.radius_x;
+    let angle = std::f32::consts::FRAC_PI_4;
+    let expected_full = 1.0
+        + wobble.deformation
+            * (wobble.deformation_frequency * angle + wobble.deformation_phase).sin();
+
+    assert_close(wobble.radial_adjustment(angle, 100), expected_full);
+    assert_close(
+        wobble.boundary_radius(angle, 50) - wobble.boundary_radius(angle, 0),
+        (wobble.boundary_radius(angle, 100) - wobble.boundary_radius(angle, 0)) * 0.5,
+    );
+}
+
+#[test]
+fn deformation_is_bounded_and_keeps_every_effective_radius_positive() {
+    let twinkle = geometric_twinkle();
+
+    for deform in [0, 25, 50, 75, 100] {
+        for index in 0..=360 {
+            let angle = index as f32 / 360.0 * std::f32::consts::TAU;
+            let adjustment = twinkle.radial_adjustment(angle, deform);
+
+            assert!(adjustment > 0.0);
+            assert!(adjustment >= 1.0 - twinkle.deformation);
+            assert!(adjustment <= 1.0 + twinkle.deformation);
+            assert!(twinkle.boundary_radius(angle, deform) > 0.0);
+        }
+    }
+}
+
+#[test]
+fn deform_preserves_seeded_primitives_and_unrelated_effect_rng_sequence() {
+    let mut circular = settings(
+        &[BokehType::Twinkle, BokehType::Edge, BokehType::Damage],
+        &[BokehPlacement::Left],
+        60,
+        70,
+        80,
+    );
+    circular.blur = 35;
+    circular.lightness = 60;
+    let mut organic = circular.clone();
+    organic.deform = 100;
+
+    let mut circular_rng = StdRng::seed_from_u64(108);
+    let circular_twinkles = generate_twinkles(&circular, 1_000, 667, &mut circular_rng);
+    let mut organic_rng = StdRng::seed_from_u64(108);
+    let organic_twinkles = generate_twinkles(&organic, 1_000, 667, &mut organic_rng);
+    assert_eq!(circular_twinkles.len(), organic_twinkles.len());
+    assert_eq!(circular_twinkles, organic_twinkles);
+
+    let circular_edges = generate_edge_exposures(&circular, 1_000, 667, &mut circular_rng);
+    let organic_edges = generate_edge_exposures(&organic, 1_000, 667, &mut organic_rng);
+    assert_eq!(circular_edges, organic_edges);
+    let circular_damage = generate_damage_segments(&circular, 1_000, 667, &mut circular_rng);
+    let organic_damage = generate_damage_segments(&organic, 1_000, 667, &mut organic_rng);
+    assert_eq!(circular_damage, organic_damage);
+
+    let mut circular_rng = StdRng::seed_from_u64(109);
+    let circular_image = render_image(&circular, &mut circular_rng);
+    let mut organic_rng = StdRng::seed_from_u64(109);
+    let organic_image = render_image(&organic, &mut organic_rng);
+    let luma = bokeh_luma(circular.lightness);
+    for (circular_pixel, organic_pixel) in circular_image.pixels().zip(organic_image.pixels()) {
+        assert_eq!(&circular_pixel.0[..3], &[luma; 3]);
+        assert_eq!(&organic_pixel.0[..3], &[luma; 3]);
+    }
+    assert_eq!(circular.blur, organic.blur);
+    assert_eq!(circular.lightness, organic.lightness);
+}
+
+#[test]
+#[ignore = "writes a seeded deform progression under .tmp"]
+fn writes_seeded_twinkle_deform_progression() {
+    const SEED: u64 = 110;
+
+    for deform in [0, 25, 50, 75, 100] {
+        let mut settings = settings(&[BokehType::Twinkle], &[BokehPlacement::Center], 60, 70, 80);
+        settings.render.resolution = Resolution::new(1_000, 667).expect("resolution is valid");
+        settings.render.amount = 4;
+        settings.render.outdir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join(".tmp")
+            .join(format!("twinkle-deform-seeded-{deform}"));
+        settings.blur = 35;
+        settings.lightness = 60;
+        settings.deform = deform;
+
+        let mut rng = StdRng::seed_from_u64(SEED);
+        generate_images_with_rng(&settings, &mut rng)
+            .expect("seeded deform diagnostic should write successfully");
+    }
+}
+
 #[test]
 fn twinkle_center_is_stronger_than_its_distant_falloff() {
     let twinkle = Twinkle {
@@ -459,7 +607,13 @@ fn twinkle_center_is_stronger_than_its_distant_falloff() {
         glow_phase: 0.0,
     };
     let mut effects = vec![0.0; 100 * 100];
-    twinkle.rasterize(&mut effects, 100, 100, BlurParameters::new(100, 100, 100));
+    twinkle.rasterize(
+        &mut effects,
+        100,
+        100,
+        BlurParameters::new(100, 100, 100),
+        0,
+    );
 
     assert!(effect_at(&effects, 100, 50, 50) > effect_at(&effects, 100, 70, 50));
     assert!(effect_at(&effects, 100, 70, 50) > effect_at(&effects, 100, 90, 50));
@@ -481,7 +635,7 @@ fn twinkle_uses_a_smooth_pancake_profile_with_a_brighter_rim() {
         glow_phase: 0.0,
     };
     let mut effects = vec![0.0; 120 * 80];
-    twinkle.rasterize(&mut effects, 120, 80, BlurParameters::new(0, 120, 80));
+    twinkle.rasterize(&mut effects, 120, 80, BlurParameters::new(0, 120, 80), 0);
     let samples: Vec<_> = (60..=96).map(|x| effect_at(&effects, 120, x, 40)).collect();
     let quantized: BTreeSet<_> = samples
         .iter()
@@ -511,9 +665,9 @@ fn twinkle_blur_changes_only_its_outer_transition() {
         glow_phase: 0.0,
     };
     let mut sharp = vec![0.0; 120 * 80];
-    twinkle.rasterize(&mut sharp, 120, 80, BlurParameters::new(0, 120, 80));
+    twinkle.rasterize(&mut sharp, 120, 80, BlurParameters::new(0, 120, 80), 0);
     let mut soft = vec![0.0; 120 * 80];
-    twinkle.rasterize(&mut soft, 120, 80, BlurParameters::new(100, 120, 80));
+    twinkle.rasterize(&mut soft, 120, 80, BlurParameters::new(100, 120, 80), 0);
 
     assert_close(
         effect_at(&sharp, 120, 60, 40),
@@ -552,7 +706,7 @@ fn partial_off_frame_twinkles_render_inside_the_image() {
         glow_phase: 0.0,
     };
     let mut effects = vec![0.0; 100 * 60];
-    twinkle.rasterize(&mut effects, 100, 60, BlurParameters::new(100, 100, 60));
+    twinkle.rasterize(&mut effects, 100, 60, BlurParameters::new(100, 100, 60), 0);
 
     assert!(effect_at(&effects, 100, 0, 30) > 0.0);
     assert!(effects.iter().any(|effect| *effect > 0.0));
