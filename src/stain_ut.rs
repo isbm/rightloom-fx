@@ -1,4 +1,10 @@
-use std::{collections::BTreeSet, fs, path::PathBuf};
+use std::{
+    collections::BTreeSet,
+    fs,
+    path::{Path, PathBuf},
+    process,
+    sync::atomic::{AtomicUsize, Ordering},
+};
 
 use image::RgbaImage;
 use rand::{Rng, SeedableRng, rngs::StdRng};
@@ -6,13 +12,43 @@ use rand::{Rng, SeedableRng, rngs::StdRng};
 use super::{
     COVERAGE_TAIL_THRESHOLD, CoarseField, DEFAULT_CONTRAST, DensityField, DensityStructure,
     FieldBounds, MAX_TIDE_RELATIVE_MODULATION, SECOND_TIDE_LINE_PROBABILITY, Stain, StainSettings,
-    TideMark, bounded_tide_contribution, choose_anchor, contrast_adjusted_density, contrast_gain,
-    density_base_alpha, finishing_blur_radius_cells, generate_images_with_rng,
-    generate_images_with_structure_contribution, lightness_luma, render_image,
-    render_image_with_structure_contribution, smoothstep, soft_outer_coverage, softness_normalized,
-    stain_count, tide_presence_probability,
+    TideMark, accumulate_scalar_effect, bounded_tide_contribution, choose_anchor,
+    contrast_adjusted_density, contrast_gain, density_base_alpha, finishing_blur_radius_cells,
+    generate_images_with_rng, generate_images_with_structure_contribution, lightness_luma,
+    render_image, render_image_with_structure_contribution, scalar_effects_to_image, smoothstep,
+    soft_outer_coverage, softness_normalized, stain_count, tide_presence_probability,
 };
-use crate::render::{ExportPolicy, RenderError, RenderSettings, Resolution};
+use crate::render::{
+    ExportPolicy, RenderError, RenderSettings, Resolution, RgbColor, blend_gray_pixel,
+};
+
+static TEST_OUTPUT_COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+struct TestOutputDir(PathBuf);
+
+impl TestOutputDir {
+    fn new() -> Self {
+        let number = TEST_OUTPUT_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join(".tmp")
+            .join(format!(
+                "rightloom-fx-stain-test-{}-{number}",
+                process::id()
+            ));
+        fs::create_dir_all(&path).expect("temporary output directory should be created");
+        Self(path)
+    }
+
+    fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for TestOutputDir {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
 
 fn settings(density: u8, blur: u8, lightness: u8) -> StainSettings {
     settings_with_contrast(density, blur, lightness, DEFAULT_CONTRAST)
@@ -88,6 +124,156 @@ fn alpha_statistics(image: &RgbaImage) -> (f64, u8) {
         .expect("test image should have pixels");
 
     (alpha_sum as f64 / image.pixels().len() as f64, maximum)
+}
+
+fn rasterized_effects(stain: &Stain, width: u32, height: u32, blur: u8) -> Vec<f32> {
+    let mut effects = vec![0.0; width as usize * height as usize];
+    stain.rasterize(&mut effects, width, height, blur);
+    effects
+}
+
+fn exported_stain(export_policy: ExportPolicy) -> (RgbaImage, RgbaImage) {
+    const SEED: u64 = 34;
+
+    let source_settings = settings(45, 50, 50);
+    let mut source_rng = StdRng::seed_from_u64(SEED);
+    let source = render_image(&source_settings, &mut source_rng);
+    let output = TestOutputDir::new();
+    let mut export_settings = source_settings;
+    export_settings.render.outdir = output.path().to_path_buf();
+    export_settings.render.export_policy = export_policy;
+    let mut export_rng = StdRng::seed_from_u64(SEED);
+
+    generate_images_with_rng(&export_settings, &mut export_rng)
+        .expect("stain output should write successfully");
+    let exported = image::open(output.path().join("stain-0001.png"))
+        .expect("stain output should be readable")
+        .to_rgba8();
+
+    (source, exported)
+}
+
+#[test]
+fn scalar_effect_union_preserves_an_existing_effect_for_zero_contribution() {
+    assert_close(accumulate_scalar_effect(0.37, 0.0), 0.37);
+}
+
+#[test]
+fn scalar_effect_union_saturates_for_a_fully_opaque_contribution() {
+    assert_close(accumulate_scalar_effect(0.37, 1.0), 1.0);
+}
+
+#[test]
+fn scalar_effect_union_matches_the_expected_combined_opacity() {
+    assert_close(accumulate_scalar_effect(0.2, 0.4), 0.52);
+}
+
+#[test]
+fn scalar_effect_union_is_order_independent() {
+    let contributions = [0.12, 0.38, 0.67, 0.25];
+    let forward = contributions
+        .into_iter()
+        .fold(0.0, accumulate_scalar_effect);
+    let reverse = contributions
+        .into_iter()
+        .rev()
+        .fold(0.0, accumulate_scalar_effect);
+
+    assert_close(forward, reverse);
+}
+
+#[test]
+fn scalar_effect_union_stays_within_the_unit_interval() {
+    let mut effect = 0.0;
+    for contribution in [0.05, 0.25, 0.75, 1.0] {
+        effect = accumulate_scalar_effect(effect, contribution);
+        assert!((0.0..=1.0).contains(&effect));
+    }
+}
+
+#[test]
+fn scalar_effects_encode_as_white_with_the_accumulated_alpha() {
+    let image = scalar_effects_to_image(&[0.0, 0.5, 1.0], 3, 1);
+
+    assert_eq!(image.get_pixel(0, 0).0, [255, 255, 255, 0]);
+    assert_eq!(image.get_pixel(1, 0).0, [255, 255, 255, 128]);
+    assert_eq!(image.get_pixel(2, 0).0, [255, 255, 255, 255]);
+}
+
+#[test]
+fn scalar_effects_avoid_repeated_source_over_rgb_renormalization() {
+    let first_alpha = 128.0 / 255.0;
+    let second_alpha = 128.0 / 255.0;
+    let scalar_effect = accumulate_scalar_effect(
+        accumulate_scalar_effect(0.0, first_alpha * 128.0 / 255.0),
+        second_alpha,
+    );
+    let scalar = scalar_effects_to_image(&[scalar_effect], 1, 1);
+    let mut source_over = RgbaImage::new(1, 1);
+
+    blend_gray_pixel(&mut source_over, 0, 0, 128, 128);
+    blend_gray_pixel(&mut source_over, 0, 0, 255, 128);
+
+    let scalar_pixel = scalar.get_pixel(0, 0);
+    assert_eq!(
+        [scalar_pixel[0], scalar_pixel[1], scalar_pixel[2]],
+        [255, 255, 255]
+    );
+    let source_over_pixel = source_over.get_pixel(0, 0);
+    assert_ne!(
+        [
+            source_over_pixel[0],
+            source_over_pixel[1],
+            source_over_pixel[2]
+        ],
+        [255, 255, 255]
+    );
+    assert_ne!(scalar, source_over);
+}
+
+#[test]
+fn default_stain_export_flattens_scalar_effects_onto_black() {
+    let (source, exported) = exported_stain(ExportPolicy::default());
+
+    for (source_pixel, exported_pixel) in source.pixels().zip(exported.pixels()) {
+        for channel in 0..3 {
+            let expected =
+                ((u32::from(source_pixel[channel]) * u32::from(source_pixel[3]) + 127) / 255) as u8;
+            assert_eq!(exported_pixel[channel], expected);
+        }
+        assert_eq!(exported_pixel[3], 255);
+    }
+}
+
+#[test]
+fn alpha_stain_export_preserves_transparency_and_source_pixels() {
+    let (source, exported) = exported_stain(ExportPolicy::PreserveAlpha);
+
+    assert_eq!(exported, source);
+    assert!(exported.pixels().any(|pixel| pixel[3] == 0));
+    assert!(exported.pixels().any(|pixel| pixel[3] > 0));
+}
+
+#[test]
+fn background_stain_export_uses_the_requested_background_color() {
+    let background = [17, 43, 89];
+    let (source, exported) = exported_stain(ExportPolicy::Flatten(RgbColor::new(
+        background[0],
+        background[1],
+        background[2],
+    )));
+
+    for (source_pixel, exported_pixel) in source.pixels().zip(exported.pixels()) {
+        for channel in 0..3 {
+            let alpha = u32::from(source_pixel[3]);
+            let expected = ((u32::from(source_pixel[channel]) * alpha
+                + u32::from(background[channel]) * (255 - alpha)
+                + 127)
+                / 255) as u8;
+            assert_eq!(exported_pixel[channel], expected);
+        }
+        assert_eq!(exported_pixel[3], 255);
+    }
 }
 
 fn tide_bounds() -> FieldBounds {
@@ -705,7 +891,7 @@ fn writes_seeded_continuous_coverage_component_diagnostics() {
     let smallest_dimension = WIDTH.min(HEIGHT) as f32;
     let mut rng = StdRng::seed_from_u64(SEED);
     let mut anchors = Vec::new();
-    let mut composite = RgbaImage::new(WIDTH, HEIGHT);
+    let mut composite_effects = vec![0.0; WIDTH as usize * HEIGHT as usize];
 
     for index in 0..stain_count(DENSITY, &mut rng) {
         let base_radius = smallest_dimension
@@ -728,16 +914,15 @@ fn writes_seeded_continuous_coverage_component_diagnostics() {
             true,
             &mut rng,
         );
-        let mut component = RgbaImage::new(WIDTH, HEIGHT);
-        stain.rasterize(&mut component, 50);
-        component
+        let component_effects = rasterized_effects(&stain, WIDTH, HEIGHT, 50);
+        scalar_effects_to_image(&component_effects, WIDTH, HEIGHT)
             .save(outdir.join(format!("component-{index:02}.png")))
             .expect("component diagnostic should write");
-        stain.rasterize(&mut composite, 50);
+        stain.rasterize(&mut composite_effects, WIDTH, HEIGHT, 50);
         anchors.push(anchor);
     }
 
-    composite
+    scalar_effects_to_image(&composite_effects, WIDTH, HEIGHT)
         .save(outdir.join("composite.png"))
         .expect("composite diagnostic should write");
 }
@@ -757,10 +942,10 @@ fn seeded_stain_preserves_normalized_macro_structure_across_resolutions() {
         assert!((small_lobe.radius_y / 600.0 - large_lobe.radius_y / 1200.0).abs() < 0.0001);
     }
 
-    let mut small_image = RgbaImage::new(800, 600);
-    small_stain.rasterize(&mut small_image, 80);
-    let mut large_image = RgbaImage::new(1600, 1200);
-    large_stain.rasterize(&mut large_image, 80);
+    let small_effects = rasterized_effects(&small_stain, 800, 600, 80);
+    let small_image = scalar_effects_to_image(&small_effects, 800, 600);
+    let large_effects = rasterized_effects(&large_stain, 1600, 1200, 80);
+    let large_image = scalar_effects_to_image(&large_effects, 1600, 1200);
 
     let small_bounds = normalized_alpha_bounds(&small_image, 4);
     let large_bounds = normalized_alpha_bounds(&large_image, 4);
@@ -871,7 +1056,7 @@ fn zero_density_is_transparent() {
         let mut rng = StdRng::seed_from_u64(seed);
         let image = render_image(&settings(0, blur, 10), &mut rng);
 
-        assert!(image.pixels().all(|pixel| pixel[3] == 0));
+        assert!(image.pixels().all(|pixel| pixel.0 == [255, 255, 255, 0]));
     }
 }
 
@@ -884,8 +1069,7 @@ fn nonzero_density_modifies_monochrome_pixels() {
     assert!(
         image
             .pixels()
-            .filter(|pixel| pixel[3] > 0)
-            .all(|pixel| pixel[0] == pixel[1] && pixel[1] == pixel[2])
+            .all(|pixel| pixel[0] == 255 && pixel[1] == 255 && pixel[2] == 255)
     );
 }
 
@@ -928,18 +1112,8 @@ fn generated_alpha_has_broad_density_variation() {
         "visible stain regions should have broad density variation"
     );
 
-    let composited_lumas: BTreeSet<_> = image
-        .pixels()
-        .filter(|pixel| pixel[3] >= 8)
-        .map(|pixel| {
-            let alpha = u16::from(pixel[3]);
-            ((u16::from(pixel[0]) * alpha + 255 * (255 - alpha) + 127) / 255) as u8
-        })
-        .collect();
     assert!(
-        *composited_lumas.last().expect("stains should be visible")
-            - *composited_lumas.first().expect("stains should be visible")
-            >= 8,
+        visible_alphas.len() > 8,
         "high-lightness stains should retain visible internal variation"
     );
 }
@@ -996,11 +1170,11 @@ fn increasing_blur_broadens_the_transition() {
 #[test]
 fn blur_zero_uses_the_existing_hard_rasterization_path() {
     let stain = seeded_stain(17, 45, true);
-    let mut dispatched = RgbaImage::new(640, 400);
-    let mut hard = RgbaImage::new(640, 400);
+    let mut dispatched = vec![0.0; 640 * 400];
+    let mut hard = vec![0.0; 640 * 400];
 
-    stain.rasterize(&mut dispatched, 0);
-    stain.rasterize_hard(&mut hard);
+    stain.rasterize(&mut dispatched, 640, 400, 0);
+    stain.rasterize_hard(&mut hard, 640, 400);
 
     assert_eq!(dispatched, hard);
 }
@@ -1064,12 +1238,12 @@ fn continuous_coverage_uses_a_quality_bounded_field_and_mild_smoothing() {
 fn diffused_rasterization_uses_the_continuous_outer_coverage_field() {
     let stain = seeded_stain(17, 45, true);
     let field = stain.diffused_outer_coverage(50);
-    let mut image = RgbaImage::new(640, 400);
-    stain.rasterize_diffused(&mut image, 50);
+    let mut effects = vec![0.0; 640 * 400];
+    stain.rasterize_diffused(&mut effects, 640, 400, 50);
 
     let mut sample = None;
-    'rows: for y in 0..image.height() {
-        for x in 0..image.width() {
+    'rows: for y in 0..400 {
+        for x in 0..640 {
             let world_x = x as f32 + 0.5;
             let world_y = y as f32 + 0.5;
             let warped_shape = stain.warped_shape_at(world_x, world_y);
@@ -1078,24 +1252,23 @@ fn diffused_rasterization_uses_the_continuous_outer_coverage_field() {
                 continue;
             }
 
-            let expected_alpha = (stain.alpha
+            let expected_effect = ((stain.alpha / 255.0)
                 * coverage
-                * stain
-                    .optical_density_at(warped_shape, world_x, world_y)
-                    .max(0.0))
-            .round()
-            .clamp(0.0, 255.0) as u8;
-            if expected_alpha > 0 {
-                sample = Some((x, y, warped_shape, expected_alpha));
+                * stain.optical_density_at(warped_shape, world_x, world_y))
+            .clamp(0.0, 1.0)
+                * f32::from(stain.shade)
+                / 255.0;
+            if expected_effect > 0.0 {
+                sample = Some((x, y, warped_shape, expected_effect));
                 break 'rows;
             }
         }
     }
 
-    let (x, y, warped_shape, expected_alpha) =
+    let (x, y, warped_shape, expected_effect) =
         sample.expect("continuous coverage should remain outside the old hard mask");
     assert_eq!(smoothstep(-stain.feather, stain.feather, warped_shape), 0.0);
-    assert_eq!(image.get_pixel(x, y)[3], expected_alpha);
+    assert_close(effects[y as usize * 640 + x as usize], expected_effect);
 }
 
 #[test]
@@ -1117,54 +1290,79 @@ fn invalid_contrast_is_rejected_before_output_is_created() {
 }
 
 #[test]
-fn lightness_never_changes_alpha_geometry_or_blur() {
+fn lightness_preserves_stain_geometry_and_coverage() {
     let mut low_rng = StdRng::seed_from_u64(19);
-    let low = render_image(&settings(45, 80, 10), &mut low_rng);
+    let low = Stain::new((320.0, 200.0), 100.0, 45, 0.45, 10, true, &mut low_rng);
+    let low_next = low_rng.random::<u64>();
     let mut mid_rng = StdRng::seed_from_u64(19);
-    let mid = render_image(&settings(45, 80, 50), &mut mid_rng);
+    let mid = Stain::new((320.0, 200.0), 100.0, 45, 0.45, 50, true, &mut mid_rng);
+    let mid_next = mid_rng.random::<u64>();
     let mut high_rng = StdRng::seed_from_u64(19);
-    let high = render_image(&settings(45, 80, 100), &mut high_rng);
+    let high = Stain::new((320.0, 200.0), 100.0, 45, 0.45, 100, true, &mut high_rng);
+    let high_next = high_rng.random::<u64>();
 
-    assert_eq!(low.dimensions(), mid.dimensions());
-    assert_eq!(mid.dimensions(), high.dimensions());
+    assert_eq!(low_next, mid_next);
+    assert_eq!(mid_next, high_next);
+    assert_eq!(low.lobes.len(), mid.lobes.len());
+    assert_eq!(mid.lobes.len(), high.lobes.len());
+    assert_eq!(low.min_x, mid.min_x);
+    assert_eq!(mid.min_x, high.min_x);
+    assert_eq!(low.max_x, mid.max_x);
+    assert_eq!(mid.max_x, high.max_x);
+    assert_eq!(low.min_y, mid.min_y);
+    assert_eq!(mid.min_y, high.min_y);
+    assert_eq!(low.max_y, mid.max_y);
+    assert_eq!(mid.max_y, high.max_y);
 
-    for ((low_pixel, mid_pixel), high_pixel) in low.pixels().zip(mid.pixels()).zip(high.pixels()) {
-        assert_eq!(low_pixel[3], mid_pixel[3]);
-        assert_eq!(mid_pixel[3], high_pixel[3]);
+    let softness = softness_normalized(80);
+    for (x, y) in [(160.0, 100.0), (320.0, 200.0), (480.0, 300.0)] {
+        assert_eq!(low.warped_shape_at(x, y), mid.warped_shape_at(x, y));
+        assert_eq!(mid.warped_shape_at(x, y), high.warped_shape_at(x, y));
+        assert_eq!(
+            low.soft_outer_coverage_at(x, y, softness),
+            mid.soft_outer_coverage_at(x, y, softness)
+        );
+        assert_eq!(
+            mid.soft_outer_coverage_at(x, y, softness),
+            high.soft_outer_coverage_at(x, y, softness)
+        );
     }
 }
 
 #[test]
-fn average_luma_increases_with_lightness() {
-    let average_luma = |lightness: u8| {
+fn average_effect_increases_with_lightness() {
+    let average_effect = |lightness: u8| {
         let mut rng = StdRng::seed_from_u64(20);
         let image = render_image(&settings(45, 50, lightness), &mut rng);
         let visible: Vec<_> = image.pixels().filter(|pixel| pixel[3] > 0).collect();
-        visible.iter().map(|pixel| u64::from(pixel[0])).sum::<u64>() as f64 / visible.len() as f64
+        visible.iter().map(|pixel| u64::from(pixel[3])).sum::<u64>() as f64 / visible.len() as f64
     };
 
-    let lumas: Vec<_> = [10, 25, 50, 75, 100]
+    let effects: Vec<_> = [10, 25, 50, 75, 100]
         .into_iter()
-        .map(average_luma)
+        .map(average_effect)
         .collect();
 
-    for window in lumas.windows(2) {
-        assert!(window[0] < window[1], "lumas should increase: {lumas:?}");
+    for window in effects.windows(2) {
+        assert!(
+            window[0] < window[1],
+            "effects should increase: {effects:?}"
+        );
     }
 }
 
 #[test]
-fn lightness_keeps_internal_luma_variation() {
+fn lightness_keeps_internal_effect_variation() {
     let mut rng = StdRng::seed_from_u64(21);
     let image = render_image(&settings(45, 50, 50), &mut rng);
-    let visible_lumas: BTreeSet<_> = image
+    let visible_effects: BTreeSet<_> = image
         .pixels()
         .filter(|pixel| pixel[3] > 0)
-        .map(|pixel| pixel[0])
+        .map(|pixel| pixel[3])
         .collect();
 
     assert!(
-        visible_lumas.len() > 1,
+        visible_effects.len() > 1,
         "internal cloudy variation should remain"
     );
 }

@@ -1,7 +1,7 @@
-use image::RgbaImage;
+use image::{Rgba, RgbaImage};
 use rand::Rng;
 
-use crate::render::{RenderError, RenderSettings, blend_gray_pixel, write_images};
+use crate::render::{RenderError, RenderSettings, write_images};
 
 const MAX_SOFTNESS_FRACTION: f32 = 0.35;
 const MIN_SOFTNESS_NORMALIZED: f32 = 0.001;
@@ -103,10 +103,10 @@ fn render_image_with_structure_contribution<R: Rng + ?Sized>(
 ) -> RgbaImage {
     let width = settings.render.resolution.width();
     let height = settings.render.resolution.height();
-    let mut image = RgbaImage::new(width, height);
+    let mut effects = vec![0.0; width as usize * height as usize];
 
     if settings.render.density == 0 {
-        return image;
+        return scalar_effects_to_image(&effects, width, height);
     }
 
     let density = settings.render.density;
@@ -130,8 +130,23 @@ fn render_image_with_structure_contribution<R: Rng + ?Sized>(
             rng,
         )
         .with_contrast_gain(contrast_gain);
-        stain.rasterize(&mut image, settings.blur);
+        stain.rasterize(&mut effects, width, height, settings.blur);
         anchors.push(anchor);
+    }
+
+    scalar_effects_to_image(&effects, width, height)
+}
+
+fn accumulate_scalar_effect(accumulated: f32, contribution: f32) -> f32 {
+    1.0 - (1.0 - accumulated) * (1.0 - contribution)
+}
+
+fn scalar_effects_to_image(effects: &[f32], width: u32, height: u32) -> RgbaImage {
+    let mut image = RgbaImage::new(width, height);
+
+    for (effect, pixel) in effects.iter().zip(image.pixels_mut()) {
+        let alpha = (effect.clamp(0.0, 1.0) * 255.0).round() as u8;
+        *pixel = Rgba([255, 255, 255, alpha]);
     }
 
     image
@@ -354,18 +369,18 @@ impl Stain {
         self
     }
 
-    fn rasterize(&self, image: &mut RgbaImage, blur: u8) {
+    fn rasterize(&self, effects: &mut [f32], width: u32, height: u32, blur: u8) {
         if blur == 0 {
-            self.rasterize_hard(image);
+            self.rasterize_hard(effects, width, height);
         } else {
-            self.rasterize_diffused(image, blur);
+            self.rasterize_diffused(effects, width, height, blur);
         }
     }
 
-    fn rasterize_hard(&self, image: &mut RgbaImage) {
-        let Some((start_x, end_x, start_y, end_y)) =
-            self.image_bounds(image, self.min_x, self.max_x, self.min_y, self.max_y)
-        else {
+    fn rasterize_hard(&self, effects: &mut [f32], width: u32, height: u32) {
+        let Some((start_x, end_x, start_y, end_y)) = self.image_bounds(
+            width, height, self.min_x, self.max_x, self.min_y, self.max_y,
+        ) else {
             return;
         };
 
@@ -379,21 +394,24 @@ impl Stain {
                     continue;
                 }
 
-                let alpha = (self.alpha
-                    * coverage
-                    * self.optical_density_at(warped_shape, world_x, world_y))
-                .round()
-                .clamp(1.0, 255.0) as u8;
-                blend_gray_pixel(image, x, y, self.shade, alpha);
+                self.accumulate_coverage(
+                    effects,
+                    width,
+                    (x, y),
+                    coverage,
+                    warped_shape,
+                    (world_x, world_y),
+                );
             }
         }
     }
 
-    fn rasterize_diffused(&self, image: &mut RgbaImage, blur: u8) {
+    fn rasterize_diffused(&self, effects: &mut [f32], width: u32, height: u32, blur: u8) {
         let coverage_field = self.diffused_outer_coverage(blur);
 
         let Some((start_x, end_x, start_y, end_y)) = self.image_bounds(
-            image,
+            width,
+            height,
             coverage_field.min_x(),
             coverage_field.max_x(),
             coverage_field.min_y(),
@@ -412,18 +430,36 @@ impl Stain {
                 }
 
                 let warped_shape = self.warped_shape_at(world_x, world_y);
-                let alpha = (self.alpha
-                    * coverage
-                    * self
-                        .optical_density_at(warped_shape, world_x, world_y)
-                        .max(0.0))
-                .round()
-                .clamp(0.0, 255.0) as u8;
-                if alpha > 0 {
-                    blend_gray_pixel(image, x, y, self.shade, alpha);
-                }
+                self.accumulate_coverage(
+                    effects,
+                    width,
+                    (x, y),
+                    coverage,
+                    warped_shape,
+                    (world_x, world_y),
+                );
             }
         }
+    }
+
+    fn accumulate_coverage(
+        &self,
+        effects: &mut [f32],
+        width: u32,
+        pixel: (u32, u32),
+        coverage: f32,
+        warped_shape: f32,
+        world: (f32, f32),
+    ) {
+        let (x, y) = pixel;
+        let (world_x, world_y) = world;
+        let alpha = ((self.alpha / 255.0)
+            * coverage
+            * self.optical_density_at(warped_shape, world_x, world_y))
+        .clamp(0.0, 1.0);
+        let contribution = alpha * f32::from(self.shade) / 255.0;
+        let index = y as usize * width as usize + x as usize;
+        effects[index] = accumulate_scalar_effect(effects[index], contribution);
     }
 
     fn diffused_outer_coverage(&self, blur: u8) -> ScalarField {
@@ -465,14 +501,15 @@ impl Stain {
 
     fn image_bounds(
         &self,
-        image: &RgbaImage,
+        width: u32,
+        height: u32,
         min_x: f32,
         max_x: f32,
         min_y: f32,
         max_y: f32,
     ) -> Option<(u32, u32, u32, u32)> {
-        let last_x = image.width().saturating_sub(1) as f32;
-        let last_y = image.height().saturating_sub(1) as f32;
+        let last_x = width.saturating_sub(1) as f32;
+        let last_y = height.saturating_sub(1) as f32;
         if max_x < 0.0 || max_y < 0.0 || min_x > last_x || min_y > last_y {
             return None;
         }
