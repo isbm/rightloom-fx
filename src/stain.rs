@@ -18,6 +18,7 @@ const TIDE_PRESENCE_ANCHORS: [(u8, f64); 6] = [
 ];
 const SECOND_TIDE_LINE_PROBABILITY: f64 = 0.0;
 const MAX_TIDE_RELATIVE_MODULATION: f32 = 0.10;
+const DENSITY_STRUCTURES_ENABLED: bool = true;
 const DENSITY_ALPHA_ANCHORS: [(u8, f32); 8] = [
     (0, 0.0),
     (5, 18.0),
@@ -71,7 +72,27 @@ fn generate_images_with_rng<R: Rng + ?Sized>(
     write_images(&settings.render, "stain", || render_image(settings, rng))
 }
 
+#[cfg(test)]
+fn generate_images_with_structure_contribution<R: Rng + ?Sized>(
+    settings: &StainSettings,
+    structures_enabled: bool,
+    rng: &mut R,
+) -> Result<(), RenderError> {
+    settings.validate()?;
+    write_images(&settings.render, "stain", || {
+        render_image_with_structure_contribution(settings, structures_enabled, rng)
+    })
+}
+
 fn render_image<R: Rng + ?Sized>(settings: &StainSettings, rng: &mut R) -> RgbaImage {
+    render_image_with_structure_contribution(settings, DENSITY_STRUCTURES_ENABLED, rng)
+}
+
+fn render_image_with_structure_contribution<R: Rng + ?Sized>(
+    settings: &StainSettings,
+    structures_enabled: bool,
+    rng: &mut R,
+) -> RgbaImage {
     let width = settings.render.resolution.width();
     let height = settings.render.resolution.height();
     let mut image = RgbaImage::new(width, height);
@@ -96,6 +117,7 @@ fn render_image<R: Rng + ?Sized>(settings: &StainSettings, rng: &mut R) -> RgbaI
             density,
             density_scale,
             settings.lightness,
+            structures_enabled,
             rng,
         );
         stain.rasterize(&mut image, settings.blur);
@@ -173,6 +195,7 @@ struct Stain {
     body_variation_field: DensityField,
     tide: Option<TideMark>,
     structures: Vec<DensityStructure>,
+    structures_enabled: bool,
     directional: Option<DirectionalDensity>,
     min_x: f32,
     max_x: f32,
@@ -200,6 +223,7 @@ impl Stain {
         density: u8,
         density_scale: f32,
         lightness: u8,
+        structures_enabled: bool,
         rng: &mut R,
     ) -> Self {
         let lobe_count = rng.random_range(4..=7);
@@ -298,6 +322,7 @@ impl Stain {
             body_variation_field,
             tide,
             structures,
+            structures_enabled,
             directional,
             lobes,
             min_x,
@@ -471,6 +496,12 @@ impl Stain {
             .iter()
             .map(|structure| structure.density_at(x, y))
             .sum();
+        // Diagnostic mode omits only the contribution; structure construction and sampling remain unchanged.
+        let structure_density = if self.structures_enabled {
+            structure_density
+        } else {
+            0.0
+        };
         (broad_density * secondary_density + structure_density).clamp(0.20, 1.35)
     }
 

@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::{collections::BTreeSet, path::PathBuf};
 
 use image::RgbaImage;
 use rand::{Rng, SeedableRng, rngs::StdRng};
@@ -6,7 +6,8 @@ use rand::{Rng, SeedableRng, rngs::StdRng};
 use super::{
     CoarseField, DensityField, FieldBounds, MAX_TIDE_RELATIVE_MODULATION,
     SECOND_TIDE_LINE_PROBABILITY, Stain, StainSettings, TideMark, bounded_tide_contribution,
-    density_base_alpha, generate_images_with_rng, lightness_luma, render_image, smoothstep,
+    density_base_alpha, generate_images_with_rng, generate_images_with_structure_contribution,
+    lightness_luma, render_image, render_image_with_structure_contribution, smoothstep,
     tide_presence_probability,
 };
 use crate::render::{ExportPolicy, RenderError, RenderSettings, Resolution};
@@ -32,6 +33,23 @@ fn settings_with_resolution(
         },
         blur,
         lightness,
+    }
+}
+
+fn structure_diagnostic_settings(outdir_name: &str) -> StainSettings {
+    StainSettings {
+        render: RenderSettings {
+            resolution: Resolution::from_aspect_ratio("3:2x6000")
+                .expect("diagnostic resolution should be valid"),
+            density: 100,
+            amount: 2,
+            outdir: PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join(".tmp")
+                .join(outdir_name),
+            export_policy: ExportPolicy::default(),
+        },
+        blur: 50,
+        lightness: 100,
     }
 }
 
@@ -84,7 +102,7 @@ fn seeded_tide_mark(density: u8) -> TideMark {
 fn seeded_stain_with_tide() -> Stain {
     for seed in 0..1_000 {
         let mut rng = StdRng::seed_from_u64(seed);
-        let stain = Stain::new((320.0, 200.0), 100.0, 100, 1.0, 100, &mut rng);
+        let stain = Stain::new((320.0, 200.0), 100.0, 100, 1.0, 100, true, &mut rng);
         if stain.tide.is_some() {
             return stain;
         }
@@ -321,11 +339,47 @@ fn seeded_rendering_is_deterministic() {
 }
 
 #[test]
+fn structure_contribution_switch_preserves_rng_sequence() {
+    let settings = settings(100, 50, 100);
+    let mut enabled_rng = StdRng::seed_from_u64(29);
+    let enabled = render_image_with_structure_contribution(&settings, true, &mut enabled_rng);
+    let enabled_next = enabled_rng.random::<u64>();
+    let mut disabled_rng = StdRng::seed_from_u64(29);
+    let disabled = render_image_with_structure_contribution(&settings, false, &mut disabled_rng);
+    let disabled_next = disabled_rng.random::<u64>();
+
+    assert_eq!(enabled.dimensions(), disabled.dimensions());
+    assert_ne!(
+        enabled, disabled,
+        "structures should affect the enabled render"
+    );
+    assert_eq!(
+        enabled_next, disabled_next,
+        "the diagnostic switch must not alter RNG use"
+    );
+}
+
+#[test]
+#[ignore = "writes seeded DensityStructure comparison PNGs under .tmp"]
+fn writes_seeded_structure_contribution_diagnostics() {
+    const SEED: u64 = 29;
+
+    for (outdir_name, structures_enabled) in
+        [("structure-enabled", true), ("structure-disabled", false)]
+    {
+        let settings = structure_diagnostic_settings(outdir_name);
+        let mut rng = StdRng::seed_from_u64(SEED);
+        generate_images_with_structure_contribution(&settings, structures_enabled, &mut rng)
+            .expect("diagnostic images should write successfully");
+    }
+}
+
+#[test]
 fn seeded_stain_preserves_normalized_macro_structure_across_resolutions() {
     let mut small_rng = StdRng::seed_from_u64(23);
-    let small_stain = Stain::new((400.0, 300.0), 100.0, 45, 0.45, 50, &mut small_rng);
+    let small_stain = Stain::new((400.0, 300.0), 100.0, 45, 0.45, 50, true, &mut small_rng);
     let mut large_rng = StdRng::seed_from_u64(23);
-    let large_stain = Stain::new((800.0, 600.0), 200.0, 45, 0.45, 50, &mut large_rng);
+    let large_stain = Stain::new((800.0, 600.0), 200.0, 45, 0.45, 50, true, &mut large_rng);
 
     assert_eq!(small_stain.lobes.len(), large_stain.lobes.len());
     for (small_lobe, large_lobe) in small_stain.lobes.iter().zip(&large_stain.lobes) {
@@ -362,7 +416,7 @@ fn seeded_stain_preserves_normalized_macro_structure_across_resolutions() {
 #[test]
 fn internal_density_has_many_distinct_final_resolution_values() {
     let mut rng = StdRng::seed_from_u64(24);
-    let stain = Stain::new((320.0, 200.0), 100.0, 45, 0.45, 50, &mut rng);
+    let stain = Stain::new((320.0, 200.0), 100.0, 45, 0.45, 50, true, &mut rng);
     let lobe = stain.lobes[0];
     let mut densities = BTreeSet::new();
 
@@ -575,7 +629,7 @@ fn increasing_blur_broadens_the_transition() {
 #[test]
 fn diffused_alpha_uses_only_the_blurred_outer_mask() {
     let mut rng = StdRng::seed_from_u64(17);
-    let stain = Stain::new((320.0, 200.0), 100.0, 45, 0.45, 10, &mut rng);
+    let stain = Stain::new((320.0, 200.0), 100.0, 45, 0.45, 10, true, &mut rng);
     let mask = stain.diffused_outer_mask(50);
     let mut image = RgbaImage::new(640, 400);
     stain.rasterize_diffused(&mut image, 50);
