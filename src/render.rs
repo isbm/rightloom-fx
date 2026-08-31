@@ -244,6 +244,7 @@ pub enum RenderError {
     InvalidDensity(u8),
     InvalidBlur(u8),
     InvalidLightness(u8),
+    InvalidSaturation(u8),
     InvalidDeform(u8),
     InvalidContrast(u8),
     InvalidSize(u8),
@@ -296,6 +297,12 @@ impl fmt::Display for RenderError {
                 write!(
                     formatter,
                     "lightness must be between 0 and 100, got {lightness}"
+                )
+            }
+            Self::InvalidSaturation(saturation) => {
+                write!(
+                    formatter,
+                    "saturation must be between 0 and 100, got {saturation}"
                 )
             }
             Self::InvalidDeform(deform) => {

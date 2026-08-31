@@ -3,7 +3,7 @@ use std::str::FromStr;
 use super::{
     Cli, Command, cli, parse_amount, parse_background, parse_blur, parse_bokeh_places,
     parse_bokeh_type, parse_contrast, parse_deform, parse_density, parse_lightness,
-    parse_scratch_type, parse_size, parse_uniform,
+    parse_saturation, parse_scratch_type, parse_size, parse_uniform,
 };
 use crate::bokeh::{BokehPlacement, BokehType};
 use crate::render::{ExportPolicy, RgbColor};
@@ -89,7 +89,7 @@ fn stain_cli_accepts_contrast_endpoints_and_default() {
 
         let parsed = match cli.command {
             Command::Stain(args) => args.contrast,
-            Command::Scratches(_) | Command::Bokeh(_) => {
+            Command::Scratches(_) | Command::Bokeh(_) | Command::Burn(_) => {
                 panic!("stain command should parse as stain")
             }
         };
@@ -142,6 +142,76 @@ fn parse_bokeh(arguments: &[&str]) -> Result<Cli, clap::Error> {
     Cli::try_parse_from(command)
 }
 
+fn parse_burn(arguments: &[&str]) -> Result<Cli, clap::Error> {
+    let mut command = vec![
+        "rightloom-fx",
+        "burn",
+        "-r",
+        "320x200",
+        "-a",
+        "1",
+        "-o",
+        "output",
+    ];
+    command.extend_from_slice(arguments);
+    Cli::try_parse_from(command)
+}
+
+#[test]
+fn burn_cli_parses_defaults_and_controls() {
+    let cli = parse_burn(&[]).expect("burn should parse with defaults");
+    let args = match cli.command {
+        Command::Burn(args) => args,
+        Command::Scratches(_) | Command::Stain(_) | Command::Bokeh(_) => {
+            panic!("burn command should parse as burn")
+        }
+    };
+
+    assert_eq!(args.render.density, 50);
+    assert_eq!(args.size, 70);
+    assert_eq!(args.blur, 70);
+    assert_eq!(args.lightness, 80);
+    assert_eq!(args.saturation, 85);
+
+    let cli = parse_burn(&[
+        "-d",
+        "100",
+        "-s",
+        "0",
+        "-b",
+        "100",
+        "-l",
+        "0",
+        "--saturation",
+        "100",
+    ])
+    .expect("burn endpoints should parse");
+    let args = match cli.command {
+        Command::Burn(args) => args,
+        Command::Scratches(_) | Command::Stain(_) | Command::Bokeh(_) => {
+            panic!("burn command should parse as burn")
+        }
+    };
+
+    assert_eq!(args.render.density, 100);
+    assert_eq!(
+        (args.size, args.blur, args.lightness, args.saturation),
+        (0, 100, 0, 100)
+    );
+}
+
+#[test]
+fn burn_cli_rejects_out_of_range_percentages() {
+    assert_eq!(parse_saturation("0"), Ok(0));
+    assert_eq!(parse_saturation("100"), Ok(100));
+    assert!(parse_saturation("101").is_err());
+    assert!(parse_burn(&["-d", "101"]).is_err());
+    assert!(parse_burn(&["-s", "101"]).is_err());
+    assert!(parse_burn(&["-b", "101"]).is_err());
+    assert!(parse_burn(&["-l", "101"]).is_err());
+    assert!(parse_burn(&["--saturation", "101"]).is_err());
+}
+
 #[test]
 fn bokeh_subcommand_and_each_type_parse() {
     for (value, expected) in [
@@ -152,7 +222,7 @@ fn bokeh_subcommand_and_each_type_parse() {
         let cli = parse_bokeh(&["-t", value]).expect("bokeh type should parse");
         let args = match cli.command {
             Command::Bokeh(args) => args,
-            Command::Scratches(_) | Command::Stain(_) => {
+            Command::Scratches(_) | Command::Stain(_) | Command::Burn(_) => {
                 panic!("bokeh command should parse as bokeh")
             }
         };
@@ -172,7 +242,9 @@ fn bokeh_cli_accepts_multiple_types() {
         .expect("multiple bokeh types should parse");
     let types = match cli.command {
         Command::Bokeh(args) => args.types,
-        Command::Scratches(_) | Command::Stain(_) => panic!("bokeh command should parse as bokeh"),
+        Command::Scratches(_) | Command::Stain(_) | Command::Burn(_) => {
+            panic!("bokeh command should parse as bokeh")
+        }
     };
 
     assert_eq!(
@@ -217,7 +289,9 @@ fn bokeh_cli_normalizes_comma_repeated_and_duplicate_placements() {
     .expect("placements should parse");
     let placements = match cli.command {
         Command::Bokeh(args) => args.placements,
-        Command::Scratches(_) | Command::Stain(_) => panic!("bokeh command should parse as bokeh"),
+        Command::Scratches(_) | Command::Stain(_) | Command::Burn(_) => {
+            panic!("bokeh command should parse as bokeh")
+        }
     };
 
     assert_eq!(
@@ -235,7 +309,9 @@ fn bokeh_cli_uses_an_empty_placement_list_for_unbiased_rendering() {
     let cli = parse_bokeh(&["-t", "twinkle"]).expect("bokeh should parse without placement");
     let placements = match cli.command {
         Command::Bokeh(args) => args.placements,
-        Command::Scratches(_) | Command::Stain(_) => panic!("bokeh command should parse as bokeh"),
+        Command::Scratches(_) | Command::Stain(_) | Command::Burn(_) => {
+            panic!("bokeh command should parse as bokeh")
+        }
     };
 
     assert!(placements.is_empty());
@@ -266,7 +342,7 @@ fn bokeh_blur_defaults_to_100_and_accepts_percentage_endpoints() {
             parse_bokeh(&["-t", "edge", "-b", value]).expect("in-range bokeh blur should parse");
         let blur = match cli.command {
             Command::Bokeh(args) => args.blur,
-            Command::Scratches(_) | Command::Stain(_) => {
+            Command::Scratches(_) | Command::Stain(_) | Command::Burn(_) => {
                 panic!("bokeh command should parse as bokeh")
             }
         };
@@ -284,7 +360,7 @@ fn bokeh_lightness_defaults_to_70_and_accepts_percentage_endpoints() {
             .expect("in-range bokeh lightness should parse");
         let lightness = match cli.command {
             Command::Bokeh(args) => args.lightness,
-            Command::Scratches(_) | Command::Stain(_) => {
+            Command::Scratches(_) | Command::Stain(_) | Command::Burn(_) => {
                 panic!("bokeh command should parse as bokeh")
             }
         };
@@ -305,7 +381,7 @@ fn bokeh_deform_defaults_to_0_and_accepts_percentage_endpoints() {
             .expect("in-range bokeh deform should parse");
         let deform = match cli.command {
             Command::Bokeh(args) => args.deform,
-            Command::Scratches(_) | Command::Stain(_) => {
+            Command::Scratches(_) | Command::Stain(_) | Command::Burn(_) => {
                 panic!("bokeh command should parse as bokeh")
             }
         };
@@ -328,7 +404,9 @@ fn bokeh_cli_reuses_shared_alpha_and_background_export_options() {
         parse_bokeh(&["-t", "twinkle", "--alpha"]).expect("alpha bokeh command should parse");
     let alpha_policy = match alpha.command {
         Command::Bokeh(args) => args.render.export_policy,
-        Command::Scratches(_) | Command::Stain(_) => panic!("bokeh command should parse as bokeh"),
+        Command::Scratches(_) | Command::Stain(_) | Command::Burn(_) => {
+            panic!("bokeh command should parse as bokeh")
+        }
     };
     assert_eq!(alpha_policy, ExportPolicy::PreserveAlpha);
 
@@ -336,7 +414,9 @@ fn bokeh_cli_reuses_shared_alpha_and_background_export_options() {
         .expect("background bokeh command should parse");
     let background_policy = match background.command {
         Command::Bokeh(args) => args.render.export_policy,
-        Command::Scratches(_) | Command::Stain(_) => panic!("bokeh command should parse as bokeh"),
+        Command::Scratches(_) | Command::Stain(_) | Command::Burn(_) => {
+            panic!("bokeh command should parse as bokeh")
+        }
     };
     assert_eq!(
         background_policy,
@@ -387,7 +467,9 @@ fn stain_cli_accepts_exact_resolution() {
             args.contrast,
             args.render.export_policy,
         ),
-        Command::Scratches(_) | Command::Bokeh(_) => panic!("stain command should parse as stain"),
+        Command::Scratches(_) | Command::Bokeh(_) | Command::Burn(_) => {
+            panic!("stain command should parse as stain")
+        }
     };
 
     assert_eq!((resolution.width(), resolution.height()), (6240, 4160));
@@ -427,7 +509,9 @@ fn stain_cli_accepts_aspect_ratio_resolution() {
             args.contrast,
             args.render.export_policy,
         ),
-        Command::Scratches(_) | Command::Bokeh(_) => panic!("stain command should parse as stain"),
+        Command::Scratches(_) | Command::Bokeh(_) | Command::Burn(_) => {
+            panic!("stain command should parse as stain")
+        }
     };
 
     assert_eq!((resolution.width(), resolution.height()), (4160, 6240));
@@ -459,7 +543,9 @@ fn stain_cli_alpha_selects_transparent_export() {
 
     let export_policy = match cli.command {
         Command::Stain(args) => args.render.export_policy,
-        Command::Scratches(_) | Command::Bokeh(_) => panic!("stain command should parse as stain"),
+        Command::Scratches(_) | Command::Bokeh(_) | Command::Burn(_) => {
+            panic!("stain command should parse as stain")
+        }
     };
 
     assert_eq!(export_policy, ExportPolicy::PreserveAlpha);
@@ -556,6 +642,24 @@ fn bokeh_help_documents_its_blur_lightness_and_deform_controls() {
     assert!(help.contains("Twinkle shape deformation, 0-100."));
     assert!(help.contains("0 = perfect circle, 100 = maximum organic deformation."));
     assert!(help.contains("[default: 0]"));
+}
+
+#[test]
+fn burn_help_documents_its_color_field_controls() {
+    let command = cli();
+    let error = command
+        .try_get_matches_from(["rightloom-fx", "burn", "--help"])
+        .expect_err("help should short-circuit parsing");
+    let help = error.to_string();
+
+    assert!(help.contains("-s, --size <PERCENT>"));
+    assert!(help.contains("[default: 70]"));
+    assert!(help.contains("-b, --blur <PERCENT>"));
+    assert!(help.contains("-l, --lightness <PERCENT>"));
+    assert!(help.contains("--saturation <PERCENT>"));
+    assert!(help.contains("[default: 85]"));
+    assert!(help.contains("Effect density from 0 to 100"));
+    assert!(!help.contains("--deform"));
 }
 
 #[test]

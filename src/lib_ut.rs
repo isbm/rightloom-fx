@@ -176,6 +176,42 @@ fn bokeh_command_writes_numbered_pngs_through_shared_output_handling() {
 }
 
 #[test]
+fn burn_command_writes_numbered_pngs_through_shared_output_handling() {
+    let output = TestOutputDir::new();
+    let output_argument = output.path().to_string_lossy().into_owned();
+
+    run_from([
+        "rightloom-fx",
+        "burn",
+        "-r",
+        "320x200",
+        "-d",
+        "50",
+        "-s",
+        "70",
+        "-b",
+        "70",
+        "-l",
+        "80",
+        "--saturation",
+        "85",
+        "-a",
+        "2",
+        "-o",
+        output_argument.as_str(),
+    ])
+    .expect("command should generate images");
+
+    for number in 1..=2 {
+        let path = output.path().join(format!("burn-{number:04}.png"));
+        assert!(path.is_file(), "{} should exist", path.display());
+        let image = image::open(&path).expect("output should be a readable PNG");
+        assert_eq!(image.dimensions(), (320, 200));
+        assert!(image.to_rgba8().pixels().all(|pixel| pixel[3] == 255));
+    }
+}
+
+#[test]
 fn bokeh_edge_rejects_center_placement_before_writing_output() {
     let output = TestOutputDir::new();
     let output_argument = output.path().to_string_lossy().into_owned();

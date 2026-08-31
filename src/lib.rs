@@ -1,4 +1,5 @@
 pub mod bokeh;
+pub mod burn;
 mod cli;
 pub mod render;
 pub mod scratches;
@@ -8,6 +9,7 @@ use std::error::Error;
 
 use crate::{
     bokeh::{BokehSettings, generate_images as generate_bokeh_images},
+    burn::{BurnSettings, generate_images as generate_burn_images},
     cli::{Cli, Command},
     render::RenderError,
     scratches::{ScratchSettings, generate_images},
@@ -39,6 +41,13 @@ fn run_cli(cli: Cli) -> Result<(), RenderError> {
             deform: args.deform,
             size: args.size,
             uniform: args.uniform,
+        }),
+        Command::Burn(args) => generate_burn_images(&BurnSettings {
+            render: args.render,
+            size: args.size,
+            blur: args.blur,
+            lightness: args.lightness,
+            saturation: args.saturation,
         }),
     }
 }

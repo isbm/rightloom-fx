@@ -21,6 +21,7 @@ pub(crate) enum Command {
     Scratches(ScratchesArgs),
     Stain(StainArgs),
     Bokeh(BokehArgs),
+    Burn(BurnArgs),
 }
 
 #[derive(Debug)]
@@ -47,6 +48,15 @@ pub(crate) struct BokehArgs {
     pub(crate) deform: u8,
     pub(crate) size: u8,
     pub(crate) uniform: u8,
+}
+
+#[derive(Debug)]
+pub(crate) struct BurnArgs {
+    pub(crate) render: RenderSettings,
+    pub(crate) size: u8,
+    pub(crate) blur: u8,
+    pub(crate) lightness: u8,
+    pub(crate) saturation: u8,
 }
 
 impl Cli {
@@ -112,6 +122,21 @@ impl Cli {
                 uniform: *arguments
                     .get_one("uniform")
                     .expect("clap supplies the bokeh uniform default"),
+            }),
+            "burn" => Command::Burn(BurnArgs {
+                render: render_settings(arguments),
+                size: *arguments
+                    .get_one("size")
+                    .expect("clap supplies the burn size default"),
+                blur: *arguments
+                    .get_one("blur")
+                    .expect("clap supplies the burn blur default"),
+                lightness: *arguments
+                    .get_one("lightness")
+                    .expect("clap supplies the burn lightness default"),
+                saturation: *arguments
+                    .get_one("saturation")
+                    .expect("clap supplies the burn saturation default"),
             }),
             _ => unreachable!("clap only exposes configured subcommands"),
         };
@@ -181,6 +206,7 @@ pub(crate) fn cli() -> ClapCommand {
         .subcommand(scratches_command(styles.clone()))
         .subcommand(stain_command(styles.clone()))
         .subcommand(bokeh_command(styles.clone()))
+        .subcommand(burn_command(styles.clone()))
         .disable_colored_help(false)
         .styles(styles)
 }
@@ -332,7 +358,72 @@ fn bokeh_command(styles: styling::Styles) -> ClapCommand {
     )
 }
 
+fn burn_command(styles: styling::Styles) -> ClapCommand {
+    shared_render_arguments_with_density_default(
+        ClapCommand::new("burn")
+            .about("Generate broad analog-film burn and light-leak color fields")
+            .styles(styles)
+            .arg(
+                Arg::new("size")
+                    .short('s')
+                    .long("size")
+                    .value_name("PERCENT")
+                    .help("Characteristic burn-field scale, 0-100.")
+                    .default_value("70")
+                    .value_parser(parse_size),
+            )
+            .arg(
+                Arg::new("blur")
+                    .short('b')
+                    .long("blur")
+                    .value_name("PERCENT")
+                    .help("Burn-field boundary softness, 0-100.")
+                    .default_value("70")
+                    .value_parser(parse_blur),
+            )
+            .arg(
+                Arg::new("lightness")
+                    .short('l')
+                    .long("lightness")
+                    .value_name("PERCENT")
+                    .help("Overall burn exposure brightness, 0-100.")
+                    .default_value("80")
+                    .value_parser(parse_lightness),
+            )
+            .arg(
+                Arg::new("saturation")
+                    .long("saturation")
+                    .value_name("PERCENT")
+                    .help("Burn palette color strength, 0-100.")
+                    .default_value("85")
+                    .value_parser(parse_saturation),
+            )
+            .after_help(
+                "Burn combines a few huge warm and cool photographic exposure fields with optional dark scorched transitions.",
+            ),
+        Some("50"),
+    )
+}
+
 fn shared_render_arguments(command: ClapCommand) -> ClapCommand {
+    shared_render_arguments_with_density_default(command, None)
+}
+
+fn shared_render_arguments_with_density_default(
+    command: ClapCommand,
+    density_default: Option<&'static str>,
+) -> ClapCommand {
+    let density = Arg::new("density")
+        .short('d')
+        .long("density")
+        .value_name("PERCENT")
+        .help("Effect density from 0 to 100")
+        .value_parser(parse_density);
+    let density = match density_default {
+        Some(default_value) => density.default_value(default_value),
+        None => density.required(true),
+    };
+
     command
         .arg(
             Arg::new("resolution")
@@ -353,15 +444,7 @@ fn shared_render_arguments(command: ClapCommand) -> ClapCommand {
                 )
                 .value_parser(parse_aspect_ratio),
         )
-        .arg(
-            Arg::new("density")
-                .short('d')
-                .long("density")
-                .value_name("PERCENT")
-                .help("Effect density from 0 to 100")
-                .required(true)
-                .value_parser(parse_density),
-        )
+        .arg(density)
         .arg(
             Arg::new("amount")
                 .short('a')
@@ -459,18 +542,22 @@ pub(crate) fn parse_contrast(value: &str) -> Result<u8, String> {
 }
 
 pub(crate) fn parse_size(value: &str) -> Result<u8, String> {
-    parse_bokeh_percentage(value, "size")
+    parse_percentage(value, "size")
 }
 
 pub(crate) fn parse_uniform(value: &str) -> Result<u8, String> {
-    parse_bokeh_percentage(value, "uniform")
+    parse_percentage(value, "uniform")
 }
 
 pub(crate) fn parse_deform(value: &str) -> Result<u8, String> {
-    parse_bokeh_percentage(value, "deform")
+    parse_percentage(value, "deform")
 }
 
-fn parse_bokeh_percentage(value: &str, name: &str) -> Result<u8, String> {
+pub(crate) fn parse_saturation(value: &str) -> Result<u8, String> {
+    parse_percentage(value, "saturation")
+}
+
+fn parse_percentage(value: &str, name: &str) -> Result<u8, String> {
     let percentage = value
         .parse::<u16>()
         .map_err(|_| format!("{name} must be an integer between 0 and 100"))?;
